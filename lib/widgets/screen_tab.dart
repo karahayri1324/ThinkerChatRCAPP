@@ -3,10 +3,9 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
-
 import 'package:provider/provider.dart';
 import '../services/ws_service.dart';
-import '../theme.dart';
+import '../services/theme_service.dart';
 
 class ScreenTab extends StatefulWidget {
   const ScreenTab({super.key});
@@ -25,6 +24,8 @@ class _ScreenTabState extends State<ScreenTab> {
   int _naturalWidth = 0;
   int _naturalHeight = 0;
   bool _decoding = false;
+
+  final TransformationController _transformCtrl = TransformationController();
 
   late void Function(Map<String, dynamic>) _frameHandler;
   late void Function(Map<String, dynamic>) _checkHandler;
@@ -99,13 +100,17 @@ class _ScreenTabState extends State<ScreenTab> {
     if (_naturalWidth == 0 || _naturalHeight == 0) return Offset.zero;
     final box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null) return Offset.zero;
-    // CustomPaint size matches the canvas exactly, so direct mapping works
+    // Account for InteractiveViewer transform
+    final matrix = _transformCtrl.value;
+    final inverted = Matrix4.inverted(matrix);
+    final transformed = MatrixUtils.transformPoint(inverted, local);
+
     final canvasSize = box.size;
     final scaleX = _naturalWidth / canvasSize.width;
     final scaleY = _naturalHeight / canvasSize.height;
     return Offset(
-      (local.dx * scaleX).clamp(0, _naturalWidth.toDouble()).roundToDouble(),
-      (local.dy * scaleY).clamp(0, _naturalHeight.toDouble()).roundToDouble(),
+      (transformed.dx * scaleX).clamp(0, _naturalWidth.toDouble()).roundToDouble(),
+      (transformed.dy * scaleY).clamp(0, _naturalHeight.toDouble()).roundToDouble(),
     );
   }
 
@@ -127,26 +132,8 @@ class _ScreenTabState extends State<ScreenTab> {
     });
   }
 
-  void _onDoubleTap() {
-    // Use last known position or center
-    if (!_streaming) return;
-    final box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final center = box.size.center(Offset.zero);
-    final remote = _toRemote(center);
-    _ws.send('screen_input', {
-      'input_type': 'mouse_dblclick',
-      'data': {'x': remote.dx.toInt(), 'y': remote.dy.toInt(), 'button': 1},
-    });
-  }
-
-  void _onPanUpdate(DragUpdateDetails d) {
-    if (!_streaming) return;
-    final remote = _toRemote(d.localPosition);
-    _ws.send('screen_input', {
-      'input_type': 'mouse_move',
-      'data': {'x': remote.dx.toInt(), 'y': remote.dy.toInt()},
-    });
+  void _resetZoom() {
+    _transformCtrl.value = Matrix4.identity();
   }
 
   @override
@@ -155,60 +142,44 @@ class _ScreenTabState extends State<ScreenTab> {
     _ws.off('screen_check_res', _checkHandler);
     _ws.off('screen_error', _errorHandler);
     _currentFrame?.dispose();
+    _transformCtrl.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final t = context.watch<ThemeService>().current;
     return Column(
       children: [
         // Controls
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          color: TokyoNight.bgSecondary,
+          color: t.bgSecondary,
           child: Column(
             children: [
               Row(
                 children: [
                   Text('FPS: ${_fps.toInt()}',
-                      style: const TextStyle(
-                          color: TokyoNight.textMuted, fontSize: 12)),
+                      style: TextStyle(color: t.textMuted, fontSize: 12)),
                   Expanded(
                     child: Slider(
-                      value: _fps,
-                      min: 1,
-                      max: 60,
-                      activeColor: TokyoNight.accent,
+                      value: _fps, min: 1, max: 60,
+                      activeColor: t.accent,
                       onChanged: (v) {
                         setState(() => _fps = v);
-                        if (_streaming) {
-                          _ws.send('screen_start', {
-                            'fps': v.toInt(),
-                            'quality': _quality.toInt(),
-                            'max_width': 1920,
-                          });
-                        }
+                        if (_streaming) _sendSettings();
                       },
                     ),
                   ),
                   Text('Q: ${_quality.toInt()}',
-                      style: const TextStyle(
-                          color: TokyoNight.textMuted, fontSize: 12)),
+                      style: TextStyle(color: t.textMuted, fontSize: 12)),
                   Expanded(
                     child: Slider(
-                      value: _quality,
-                      min: 10,
-                      max: 95,
-                      activeColor: TokyoNight.accent,
+                      value: _quality, min: 10, max: 95,
+                      activeColor: t.accent,
                       onChanged: (v) {
                         setState(() => _quality = v);
-                        if (_streaming) {
-                          _ws.send('screen_start', {
-                            'fps': _fps.toInt(),
-                            'quality': v.toInt(),
-                            'max_width': 1920,
-                          });
-                        }
+                        if (_streaming) _sendSettings();
                       },
                     ),
                   ),
@@ -219,63 +190,74 @@ class _ScreenTabState extends State<ScreenTab> {
                   ElevatedButton(
                     onPressed: !_available ? null : (_streaming ? _stop : _start),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: _streaming
-                          ? TokyoNight.danger
-                          : TokyoNight.accent,
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 24, vertical: 8),
+                      backgroundColor: _streaming ? t.danger : t.accent,
+                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
                     ),
                     child: Text(_streaming ? 'Stop' : 'Start'),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: 8),
+                  if (_streaming)
+                    IconButton(
+                      icon: const Icon(Icons.zoom_out_map, size: 20),
+                      color: t.textMuted,
+                      tooltip: 'Reset zoom',
+                      onPressed: _resetZoom,
+                    ),
+                  const Spacer(),
                   Text(
-                    !_available
-                        ? 'Not available'
-                        : _streaming
-                            ? 'Streaming...'
-                            : 'Ready',
-                    style: const TextStyle(
-                        color: TokyoNight.textMuted, fontSize: 12),
+                    !_available ? 'Not available'
+                        : _streaming ? 'Pinch to zoom' : 'Ready',
+                    style: TextStyle(color: t.textMuted, fontSize: 12),
                   ),
                 ],
               ),
             ],
           ),
         ),
-        const Divider(height: 1, color: TokyoNight.border),
-        // Canvas
+        Divider(height: 1, color: t.border),
+        // Canvas with pinch-to-zoom
         Expanded(
           child: Container(
             color: Colors.black,
-            child: Center(
-              child: _currentFrame == null
-                  ? const Text(
-                      'No frame',
-                      style: TextStyle(color: TokyoNight.textMuted),
-                    )
-                  : GestureDetector(
-                      onTapDown: _onTapDown,
-                      onTapUp: _onTapUp,
-                      onDoubleTap: _onDoubleTap,
-                      onPanUpdate: _onPanUpdate,
-                      child: CustomPaint(
-                        key: _canvasKey,
-                        painter: _FramePainter(_currentFrame!),
-                        size: _calculateSize(context),
+            child: _currentFrame == null
+                ? Center(child: Text('No frame', style: TextStyle(color: t.textMuted)))
+                : InteractiveViewer(
+                    transformationController: _transformCtrl,
+                    minScale: 1.0,
+                    maxScale: 5.0,
+                    panEnabled: true,
+                    scaleEnabled: true,
+                    child: Center(
+                      child: GestureDetector(
+                        onTapDown: _onTapDown,
+                        onTapUp: _onTapUp,
+                        child: CustomPaint(
+                          key: _canvasKey,
+                          painter: _FramePainter(_currentFrame!),
+                          size: _calculateSize(context),
+                        ),
                       ),
                     ),
-            ),
+                  ),
           ),
         ),
       ],
     );
   }
 
+  void _sendSettings() {
+    _ws.send('screen_start', {
+      'fps': _fps.toInt(),
+      'quality': _quality.toInt(),
+      'max_width': 1920,
+    });
+  }
+
   Size _calculateSize(BuildContext context) {
     if (_naturalWidth == 0 || _naturalHeight == 0) return Size.zero;
     final screen = MediaQuery.of(context).size;
     final maxW = screen.width;
-    final maxH = screen.height - 200; // Approx space minus controls
+    final maxH = screen.height - 200;
     final ratio = _naturalWidth / _naturalHeight;
     double w, h;
     if (maxW / maxH > ratio) {

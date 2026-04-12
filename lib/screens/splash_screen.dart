@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/auth_service.dart';
-import '../theme.dart';
+import '../services/theme_service.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -31,7 +31,8 @@ class _SplashScreenState extends State<SplashScreen>
 
   Future<void> _initApp() async {
     final auth = context.read<AuthService>();
-    await auth.init();
+    final themeSvc = context.read<ThemeService>();
+    await Future.wait([auth.init(), themeSvc.init()]);
     await Future.delayed(const Duration(milliseconds: 2800));
     if (!mounted) return;
     if (auth.isLoggedIn && auth.serverUrl != null) {
@@ -49,18 +50,19 @@ class _SplashScreenState extends State<SplashScreen>
 
   @override
   Widget build(BuildContext context) {
+    final t = context.watch<ThemeService>().current;
     return Scaffold(
-      backgroundColor: TokyoNight.bgPrimary,
+      backgroundColor: t.bgPrimary,
       body: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Image.asset('assets/logo.png', width: 220),
             const SizedBox(height: 20),
-            const Text(
+            Text(
               'Connecting...',
               style: TextStyle(
-                color: TokyoNight.textMuted,
+                color: t.textMuted,
                 fontSize: 14,
                 letterSpacing: 1,
               ),
@@ -76,10 +78,8 @@ class _SplashScreenState extends State<SplashScreen>
                   builder: (context, _) {
                     return LinearProgressIndicator(
                       value: _progressAnim.value,
-                      backgroundColor: TokyoNight.bgTertiary,
-                      valueColor: const AlwaysStoppedAnimation<Color>(
-                        TokyoNight.accent,
-                      ),
+                      backgroundColor: t.bgTertiary,
+                      valueColor: AlwaysStoppedAnimation<Color>(t.accent),
                       minHeight: 3,
                     );
                   },

@@ -1,9 +1,10 @@
-
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:xterm/xterm.dart';
 import '../services/ws_service.dart';
-import '../theme.dart';
+import '../services/theme_service.dart';
+import '../services/terminal_history_service.dart';
 
 class _ShellEntry {
   final String id;
@@ -36,17 +37,17 @@ class _TerminalTabState extends State<TerminalTab> {
       final entry = _shells.where((s) => s.id == shellId).firstOrNull;
       if (entry != null) {
         entry.terminal.write(data);
+        // Save to history in background
+        TerminalHistoryService.saveOutput(shellId, data);
       }
     };
     _ws.on('shell_output', _outputHandler);
     _createShell();
   }
 
-  void _createShell() {
+  Future<void> _createShell() async {
     final shellId = '${_nextId++}';
-    final terminal = Terminal(
-      maxLines: 5000,
-    );
+    final terminal = Terminal(maxLines: 5000);
 
     terminal.onOutput = (data) {
       _ws.send('shell_input', {'shell_id': shellId, 'data': data});
@@ -59,6 +60,13 @@ class _TerminalTabState extends State<TerminalTab> {
         'rows': height,
       });
     };
+
+    // Restore previous history if exists
+    final savedHistory = await TerminalHistoryService.getOutput(shellId);
+    if (savedHistory != null && savedHistory.isNotEmpty) {
+      terminal.write(savedHistory);
+      terminal.write('\r\n--- Session restored ---\r\n');
+    }
 
     _ws.send('shell_create', {'shell_id': shellId});
 
@@ -82,6 +90,7 @@ class _TerminalTabState extends State<TerminalTab> {
 
   void _sendKey(String data) {
     if (_shells.isEmpty) return;
+    HapticFeedback.lightImpact();
     final shellId = _shells[_activeIndex].id;
     _ws.send('shell_input', {'shell_id': shellId, 'data': data});
   }
@@ -94,12 +103,13 @@ class _TerminalTabState extends State<TerminalTab> {
 
   @override
   Widget build(BuildContext context) {
+    final t = context.watch<ThemeService>().current;
     return Column(
       children: [
         // Tab bar
         Container(
           height: 36,
-          color: TokyoNight.bgSecondary,
+          color: t.bgSecondary,
           child: Row(
             children: [
               Expanded(
@@ -115,9 +125,7 @@ class _TerminalTabState extends State<TerminalTab> {
                         padding: const EdgeInsets.symmetric(horizontal: 12),
                         alignment: Alignment.center,
                         decoration: BoxDecoration(
-                          color: active
-                              ? TokyoNight.bgPrimary
-                              : Colors.transparent,
+                          color: active ? t.bgPrimary : Colors.transparent,
                           borderRadius: const BorderRadius.vertical(
                             top: Radius.circular(4),
                           ),
@@ -129,9 +137,7 @@ class _TerminalTabState extends State<TerminalTab> {
                               _shells[i].id,
                               style: TextStyle(
                                 fontSize: 12,
-                                color: active
-                                    ? TokyoNight.accent
-                                    : TokyoNight.textMuted,
+                                color: active ? t.accent : t.textMuted,
                               ),
                             ),
                             if (_shells.length > 1) ...[
@@ -142,8 +148,8 @@ class _TerminalTabState extends State<TerminalTab> {
                                   Icons.close,
                                   size: 14,
                                   color: active
-                                      ? TokyoNight.textMuted
-                                      : TokyoNight.textMuted.withOpacity(0.5),
+                                      ? t.textMuted
+                                      : t.textMuted.withOpacity(0.5),
                                 ),
                               ),
                             ],
@@ -156,15 +162,15 @@ class _TerminalTabState extends State<TerminalTab> {
               ),
               InkWell(
                 onTap: _createShell,
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 12),
-                  child: Icon(Icons.add, size: 18, color: TokyoNight.textMuted),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Icon(Icons.add, size: 18, color: t.textMuted),
                 ),
               ),
             ],
           ),
         ),
-        const Divider(height: 1, color: TokyoNight.border),
+        Divider(height: 1, color: t.border),
         // Terminal view
         Expanded(
           child: _shells.isEmpty
@@ -175,37 +181,13 @@ class _TerminalTabState extends State<TerminalTab> {
                     fontSize: 13,
                     fontFamily: 'monospace',
                   ),
-                  theme: const TerminalTheme(
-                    cursor: TokyoNight.textPrimary,
-                    selection: Color(0xFF33467c),
-                    foreground: TokyoNight.textSecondary,
-                    background: TokyoNight.bgPrimary,
-                    black: TokyoNight.termBlack,
-                    red: TokyoNight.termRed,
-                    green: TokyoNight.termGreen,
-                    yellow: TokyoNight.termYellow,
-                    blue: TokyoNight.termBlue,
-                    magenta: TokyoNight.termMagenta,
-                    cyan: TokyoNight.termCyan,
-                    white: TokyoNight.termWhite,
-                    brightBlack: TokyoNight.termBrightBlack,
-                    brightRed: TokyoNight.termRed,
-                    brightGreen: TokyoNight.termGreen,
-                    brightYellow: TokyoNight.termYellow,
-                    brightBlue: TokyoNight.termBlue,
-                    brightMagenta: TokyoNight.termMagenta,
-                    brightCyan: TokyoNight.termCyan,
-                    brightWhite: TokyoNight.termBrightWhite,
-                    searchHitBackground: TokyoNight.accent,
-                    searchHitBackgroundCurrent: TokyoNight.warning,
-                    searchHitForeground: TokyoNight.bgPrimary,
-                  ),
+                  theme: t.toTerminalTheme(),
                   autofocus: true,
                 ),
         ),
         // Keyboard helper bar
         Container(
-          color: TokyoNight.bgSecondary,
+          color: t.bgSecondary,
           child: SafeArea(
             top: false,
             child: SingleChildScrollView(
@@ -213,28 +195,28 @@ class _TerminalTabState extends State<TerminalTab> {
               padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
               child: Row(
                 children: [
-                  _kbButton('ESC', '\x1b'),
-                  _kbButton('TAB', '\t'),
-                  _kbButton('^C', '\x03'),
-                  _kbButton('^D', '\x04'),
-                  _kbButton('^Z', '\x1a'),
-                  _kbButton('^L', '\x0c'),
-                  _arrowButton(Icons.arrow_upward, '\x1b[A'),
-                  _arrowButton(Icons.arrow_downward, '\x1b[B'),
-                  _arrowButton(Icons.arrow_back, '\x1b[D'),
-                  _arrowButton(Icons.arrow_forward, '\x1b[C'),
-                  _kbButton('HOME', '\x1b[H'),
-                  _kbButton('END', '\x1b[F'),
-                  _kbButton('PGUP', '\x1b[5~'),
-                  _kbButton('PGDN', '\x1b[6~'),
-                  _kbButton('DEL', '\x1b[3~'),
-                  _kbButton('INS', '\x1b[2~'),
-                  _kbButton('|', '|'),
-                  _kbButton('/', '/'),
-                  _kbButton('-', '-'),
-                  _kbButton('~', '~'),
-                  _kbButton('_', '_'),
-                  _kbButton('\\', '\\'),
+                  _kbButton(t, 'ESC', '\x1b'),
+                  _kbButton(t, 'TAB', '\t'),
+                  _kbButton(t, '^C', '\x03'),
+                  _kbButton(t, '^D', '\x04'),
+                  _kbButton(t, '^Z', '\x1a'),
+                  _kbButton(t, '^L', '\x0c'),
+                  _arrowButton(t, Icons.arrow_upward, '\x1b[A'),
+                  _arrowButton(t, Icons.arrow_downward, '\x1b[B'),
+                  _arrowButton(t, Icons.arrow_back, '\x1b[D'),
+                  _arrowButton(t, Icons.arrow_forward, '\x1b[C'),
+                  _kbButton(t, 'HOME', '\x1b[H'),
+                  _kbButton(t, 'END', '\x1b[F'),
+                  _kbButton(t, 'PGUP', '\x1b[5~'),
+                  _kbButton(t, 'PGDN', '\x1b[6~'),
+                  _kbButton(t, 'DEL', '\x1b[3~'),
+                  _kbButton(t, 'INS', '\x1b[2~'),
+                  _kbButton(t, '|', '|'),
+                  _kbButton(t, '/', '/'),
+                  _kbButton(t, '-', '-'),
+                  _kbButton(t, '~', '~'),
+                  _kbButton(t, '_', '_'),
+                  _kbButton(t, '\\', '\\'),
                 ],
               ),
             ),
@@ -244,11 +226,11 @@ class _TerminalTabState extends State<TerminalTab> {
     );
   }
 
-  Widget _kbButton(String label, String data) {
+  Widget _kbButton(AppThemeData t, String label, String data) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 2),
       child: Material(
-        color: TokyoNight.bgTertiary,
+        color: t.bgTertiary,
         borderRadius: BorderRadius.circular(6),
         child: InkWell(
           borderRadius: BorderRadius.circular(6),
@@ -259,8 +241,8 @@ class _TerminalTabState extends State<TerminalTab> {
             alignment: Alignment.center,
             child: Text(
               label,
-              style: const TextStyle(
-                color: TokyoNight.textPrimary,
+              style: TextStyle(
+                color: t.textPrimary,
                 fontSize: 12,
                 fontFamily: 'monospace',
               ),
@@ -271,11 +253,11 @@ class _TerminalTabState extends State<TerminalTab> {
     );
   }
 
-  Widget _arrowButton(IconData icon, String data) {
+  Widget _arrowButton(AppThemeData t, IconData icon, String data) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 2),
       child: Material(
-        color: TokyoNight.bgTertiary,
+        color: t.bgTertiary,
         borderRadius: BorderRadius.circular(6),
         child: InkWell(
           borderRadius: BorderRadius.circular(6),
@@ -283,7 +265,7 @@ class _TerminalTabState extends State<TerminalTab> {
           child: Container(
             constraints: const BoxConstraints(minWidth: 40, minHeight: 36),
             alignment: Alignment.center,
-            child: Icon(icon, size: 16, color: TokyoNight.textPrimary),
+            child: Icon(icon, size: 16, color: t.textPrimary),
           ),
         ),
       ),

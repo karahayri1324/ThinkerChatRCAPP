@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/auth_service.dart';
 import '../services/ws_service.dart';
-import '../theme.dart';
+import '../services/theme_service.dart';
 import '../widgets/terminal_tab.dart';
 import '../widgets/files_tab.dart';
 import '../widgets/dashboard_tab.dart';
@@ -57,11 +57,12 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     ws.on('error', (msg) {
       if (mounted) {
+        final t = context.read<ThemeService>().current;
         final message = msg['payload']?['message'] ?? 'Error';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(message.toString()),
-            backgroundColor: TokyoNight.danger,
+            backgroundColor: t.danger,
           ),
         );
       }
@@ -87,24 +88,24 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Color get _statusColor {
-    if (_agentOnline) return TokyoNight.success;
-    if (_wsConnected) return TokyoNight.warning;
-    return TokyoNight.danger;
-  }
-
-  String get _statusText {
-    if (_agentOnline) return 'Agent Online';
-    if (_wsConnected) return 'Connecting...';
-    return 'Offline';
-  }
-
   @override
   Widget build(BuildContext context) {
+    final t = context.watch<ThemeService>().current;
+    final statusColor = _agentOnline
+        ? t.success
+        : _wsConnected
+            ? t.warning
+            : t.danger;
+    final statusText = _agentOnline
+        ? 'Agent Online'
+        : _wsConnected
+            ? 'Connecting...'
+            : 'Offline';
+
     return Scaffold(
-      backgroundColor: TokyoNight.bgPrimary,
+      backgroundColor: t.bgPrimary,
       appBar: AppBar(
-        backgroundColor: TokyoNight.bgSecondary,
+        backgroundColor: t.bgSecondary,
         toolbarHeight: 48,
         titleSpacing: 8,
         title: Row(
@@ -113,29 +114,29 @@ class _HomeScreenState extends State<HomeScreen> {
               width: 10,
               height: 10,
               decoration: BoxDecoration(
-                color: _statusColor,
+                color: statusColor,
                 shape: BoxShape.circle,
                 boxShadow: _agentOnline
-                    ? [BoxShadow(color: _statusColor, blurRadius: 6)]
+                    ? [BoxShadow(color: statusColor, blurRadius: 6)]
                     : null,
               ),
             ),
             const SizedBox(width: 8),
             Text(
-              _statusText,
-              style: const TextStyle(fontSize: 12, color: TokyoNight.textMuted),
+              statusText,
+              style: TextStyle(fontSize: 12, color: t.textMuted),
             ),
           ],
         ),
         actions: [
           IconButton(
             icon: const Icon(Icons.settings, size: 20),
-            color: TokyoNight.textMuted,
+            color: t.textMuted,
             onPressed: _openSettings,
           ),
           IconButton(
             icon: const Icon(Icons.logout, size: 20),
-            color: TokyoNight.textMuted,
+            color: t.textMuted,
             onPressed: _logout,
           ),
         ],
@@ -150,9 +151,9 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
       bottomNavigationBar: Container(
-        decoration: const BoxDecoration(
-          color: TokyoNight.bgSecondary,
-          border: Border(top: BorderSide(color: TokyoNight.border, width: 1)),
+        decoration: BoxDecoration(
+          color: t.bgSecondary,
+          border: Border(top: BorderSide(color: t.border, width: 1)),
         ),
         child: SafeArea(
           child: Padding(
@@ -175,18 +176,14 @@ class _HomeScreenState extends State<HomeScreen> {
                         Icon(
                           _tabIcons[i],
                           size: 22,
-                          color: active
-                              ? TokyoNight.accent
-                              : TokyoNight.textMuted,
+                          color: active ? t.accent : t.textMuted,
                         ),
                         const SizedBox(height: 2),
                         Text(
                           _tabLabels[i],
                           style: TextStyle(
                             fontSize: 10,
-                            color: active
-                                ? TokyoNight.accent
-                                : TokyoNight.textMuted,
+                            color: active ? t.accent : t.textMuted,
                             fontWeight:
                                 active ? FontWeight.w600 : FontWeight.normal,
                           ),

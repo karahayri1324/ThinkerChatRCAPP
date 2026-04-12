@@ -1,14 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:open_file/open_file.dart';
 import 'package:file_picker/file_picker.dart';
 import '../services/ws_service.dart';
-import '../theme.dart';
+import '../services/theme_service.dart';
 
 class FilesTab extends StatefulWidget {
   const FilesTab({super.key});
@@ -23,13 +23,20 @@ class _FilesTabState extends State<FilesTab> {
   List<Map<String, dynamic>> _entries = [];
   bool _loading = false;
   String? _error;
-
-  // Download state
   final Map<String, _DownloadState> _downloads = {};
+
+  // Preview state
+  final Map<String, _DownloadState> _previews = {};
 
   late void Function(Map<String, dynamic>) _listHandler;
   late void Function(Map<String, dynamic>) _downloadHandler;
   late void Function(Map<String, dynamic>) _uploadAckHandler;
+
+  static const _imageExts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'};
+  static const _textExts = {'.txt', '.log', '.md', '.json', '.yaml', '.yml',
+      '.xml', '.csv', '.ini', '.conf', '.cfg', '.sh', '.bash', '.py', '.js',
+      '.dart', '.html', '.css', '.toml', '.env', '.gitignore'};
+  static const _maxPreviewSize = 512 * 1024; // 512KB
 
   @override
   void initState() {
@@ -39,10 +46,7 @@ class _FilesTabState extends State<FilesTab> {
     _listHandler = (msg) {
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       if (payload['error'] != null) {
-        setState(() {
-          _error = payload['error'] as String;
-          _loading = false;
-        });
+        setState(() { _error = payload['error'] as String; _loading = false; });
         return;
       }
       setState(() {
@@ -54,34 +58,38 @@ class _FilesTabState extends State<FilesTab> {
           if (a['is_dir'] != true && b['is_dir'] == true) return 1;
           return (a['name'] as String).compareTo(b['name'] as String);
         });
-        _loading = false;
-        _error = null;
+        _loading = false; _error = null;
       });
     };
 
     _downloadHandler = (msg) {
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       final path = payload['path'] as String? ?? '';
-      final dl = _downloads[path];
-      if (dl == null) return;
-
       final chunkIndex = payload['chunk_index'] as int?;
       if (chunkIndex == null) return;
-      dl.chunks[chunkIndex] = payload['data'] as String? ?? '';
+      final data = payload['data'] as String? ?? '';
+      final done = payload['done'] == true;
 
-      if (payload['done'] == true) {
-        _finishDownload(path, dl);
+      // Check if it's a preview download
+      final preview = _previews[path];
+      if (preview != null) {
+        preview.chunks[chunkIndex] = data;
+        if (done) _finishPreview(path, preview);
+        return;
       }
+
+      final dl = _downloads[path];
+      if (dl == null) return;
+      dl.chunks[chunkIndex] = data;
+      if (done) _finishDownload(path, dl);
     };
 
     _uploadAckHandler = (msg) {
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       if (payload['success'] != true && mounted) {
+        final t = context.read<ThemeService>().current;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Upload error: ${payload['error']}'),
-            backgroundColor: TokyoNight.danger,
-          ),
+          SnackBar(content: Text('Upload error: ${payload['error']}'), backgroundColor: t.danger),
         );
       }
     };
@@ -89,19 +97,142 @@ class _FilesTabState extends State<FilesTab> {
     _ws.on('file_list_res', _listHandler);
     _ws.on('file_download_chunk', _downloadHandler);
     _ws.on('file_upload_ack', _uploadAckHandler);
-
     _navigate(_currentPath);
   }
 
   void _navigate(String path) {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+    setState(() { _loading = true; _error = null; });
     _ws.send('file_list_req', {'path': path});
   }
 
+  String _ext(String name) {
+    final dot = name.lastIndexOf('.');
+    return dot >= 0 ? name.substring(dot).toLowerCase() : '';
+  }
+
+  bool _canPreview(String name, int size) {
+    if (size > _maxPreviewSize || size == 0) return false;
+    final ext = _ext(name);
+    return _imageExts.contains(ext) || _textExts.contains(ext);
+  }
+
+  void _requestPreview(String fullPath, String filename, int size) {
+    _previews[fullPath] = _DownloadState(filename);
+    _ws.send('file_download_req', {'path': fullPath});
+  }
+
+  void _finishPreview(String path, _DownloadState dl) {
+    _previews.remove(path);
+    try {
+      final sortedKeys = dl.chunks.keys.toList()..sort();
+      final combined = sortedKeys.map((k) => dl.chunks[k]!).join('');
+      final bytes = base64Decode(combined);
+      final ext = _ext(dl.filename);
+
+      if (_imageExts.contains(ext)) {
+        _showImagePreview(dl.filename, bytes, path);
+      } else {
+        final text = String.fromCharCodes(bytes);
+        _showTextPreview(dl.filename, text, path);
+      }
+    } catch (e) {
+      debugPrint('Preview error: $e');
+    }
+  }
+
+  void _showImagePreview(String filename, Uint8List bytes, String remotePath) {
+    final t = context.read<ThemeService>().current;
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: t.bgSecondary,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  Expanded(child: Text(filename, style: TextStyle(color: t.textPrimary, fontSize: 14, fontWeight: FontWeight.w500), overflow: TextOverflow.ellipsis)),
+                  IconButton(icon: const Icon(Icons.close, size: 20), color: t.textMuted, onPressed: () => Navigator.pop(ctx)),
+                ],
+              ),
+            ),
+            ConstrainedBox(
+              constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.5),
+              child: InteractiveViewer(child: Image.memory(bytes, fit: BoxFit.contain)),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  icon: const Icon(Icons.download, size: 18),
+                  label: const Text('Download'),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _startDownload(remotePath, filename);
+                  },
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showTextPreview(String filename, String text, String remotePath) {
+    final t = context.read<ThemeService>().current;
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: t.bgSecondary,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  Expanded(child: Text(filename, style: TextStyle(color: t.textPrimary, fontSize: 14, fontWeight: FontWeight.w500), overflow: TextOverflow.ellipsis)),
+                  IconButton(icon: const Icon(Icons.close, size: 20), color: t.textMuted, onPressed: () => Navigator.pop(ctx)),
+                ],
+              ),
+            ),
+            Divider(height: 1, color: t.border),
+            ConstrainedBox(
+              constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.5),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(12),
+                child: SelectableText(
+                  text,
+                  style: TextStyle(color: t.textSecondary, fontSize: 12, fontFamily: 'monospace'),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  icon: const Icon(Icons.download, size: 18),
+                  label: const Text('Download'),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _startDownload(remotePath, filename);
+                  },
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _finishDownload(String path, _DownloadState dl) async {
+    final t = context.read<ThemeService>().current;
     try {
       final sortedKeys = dl.chunks.keys.toList()..sort();
       final combined = sortedKeys.map((k) => dl.chunks[k]!).join('');
@@ -111,117 +242,73 @@ class _FilesTabState extends State<FilesTab> {
       await file.writeAsBytes(bytes);
       _downloads.remove(path);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Downloaded ${dl.filename}'),
-            backgroundColor: TokyoNight.success,
-            action: SnackBarAction(
-              label: 'Open',
-              textColor: TokyoNight.bgPrimary,
-              onPressed: () => OpenFile.open(file.path),
-            ),
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Downloaded ${dl.filename}'), backgroundColor: t.success,
+          action: SnackBarAction(label: 'Open', textColor: t.bgPrimary, onPressed: () => OpenFile.open(file.path)),
+        ));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Download error: $e'),
-            backgroundColor: TokyoNight.danger,
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Download error: $e'), backgroundColor: t.danger));
       }
     }
   }
 
   void _startDownload(String fullPath, String filename) {
+    final t = context.read<ThemeService>().current;
     _downloads[fullPath] = _DownloadState(filename);
     _ws.send('file_download_req', {'path': fullPath});
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Downloading $filename...'),
-        backgroundColor: TokyoNight.bgSecondary,
-      ),
+      SnackBar(content: Text('Downloading $filename...'), backgroundColor: t.bgSecondary),
     );
   }
 
   Future<void> _pickAndUpload() async {
+    final t = context.read<ThemeService>().current;
     final result = await FilePicker.platform.pickFiles(allowMultiple: true);
     if (result == null) return;
-
     for (final pf in result.files) {
       if (pf.path == null) continue;
       final file = File(pf.path!);
       final bytes = await file.readAsBytes();
       final filename = pf.name;
-      final targetPath =
-          '${_currentPath == '/' ? '/' : '$_currentPath/'}$filename';
+      final targetPath = '${_currentPath == '/' ? '/' : '$_currentPath/'}$filename';
       const chunkSize = 524288;
       final totalChunks = (bytes.length / chunkSize).ceil().clamp(1, 999999);
-
-      _ws.send('file_upload_start', {
-        'path': targetPath,
-        'total_size': bytes.length,
-        'total_chunks': totalChunks,
-      });
-
+      _ws.send('file_upload_start', {'path': targetPath, 'total_size': bytes.length, 'total_chunks': totalChunks});
       for (int i = 0; i < totalChunks; i++) {
         final start = i * chunkSize;
         final end = (start + chunkSize).clamp(0, bytes.length);
-        final chunk = bytes.sublist(start, end);
         _ws.send('file_upload_chunk', {
-          'path': targetPath,
-          'chunk_index': i,
-          'data': base64Encode(chunk),
+          'path': targetPath, 'chunk_index': i,
+          'data': base64Encode(bytes.sublist(start, end)),
           'done': i == totalChunks - 1,
         });
       }
-
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Uploaded $filename'),
-            backgroundColor: TokyoNight.success,
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Uploaded $filename'), backgroundColor: t.success));
       }
     }
-    // Refresh after upload
-    Future.delayed(const Duration(milliseconds: 500), () {
-      if (mounted) _navigate(_currentPath);
-    });
+    Future.delayed(const Duration(milliseconds: 500), () { if (mounted) _navigate(_currentPath); });
   }
 
   void _showPathDialog() {
+    final t = context.read<ThemeService>().current;
     final ctrl = TextEditingController(text: _currentPath);
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: TokyoNight.bgSecondary,
-        title: const Text('Go to path', style: TextStyle(color: TokyoNight.textPrimary)),
+        backgroundColor: t.bgSecondary,
+        title: Text('Go to path', style: TextStyle(color: t.textPrimary)),
         content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          style: const TextStyle(color: TokyoNight.textPrimary, fontFamily: 'monospace'),
+          controller: ctrl, autofocus: true,
+          style: TextStyle(color: t.textPrimary, fontFamily: 'monospace'),
           decoration: const InputDecoration(hintText: '/path/to/directory'),
-          onSubmitted: (v) {
-            Navigator.pop(ctx);
-            _navigate(v);
-          },
+          onSubmitted: (v) { Navigator.pop(ctx); _navigate(v); },
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              _navigate(ctrl.text);
-            },
-            child: const Text('Go'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(onPressed: () { Navigator.pop(ctx); _navigate(ctrl.text); }, child: const Text('Go')),
         ],
       ),
     );
@@ -237,12 +324,12 @@ class _FilesTabState extends State<FilesTab> {
 
   @override
   Widget build(BuildContext context) {
+    final t = context.watch<ThemeService>().current;
     return Column(
       children: [
-        // Path toolbar
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-          color: TokyoNight.bgSecondary,
+          color: t.bgSecondary,
           child: Row(
             children: [
               Expanded(
@@ -250,87 +337,49 @@ class _FilesTabState extends State<FilesTab> {
                   onTap: _showPathDialog,
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: TokyoNight.bgPrimary,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: TokyoNight.border),
-                    ),
-                    child: Text(
-                      _currentPath,
-                      style: const TextStyle(
-                        color: TokyoNight.textPrimary,
-                        fontSize: 13,
-                        fontFamily: 'monospace',
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
+                    decoration: BoxDecoration(color: t.bgPrimary, borderRadius: BorderRadius.circular(6), border: Border.all(color: t.border)),
+                    child: Text(_currentPath, style: TextStyle(color: t.textPrimary, fontSize: 13, fontFamily: 'monospace'), overflow: TextOverflow.ellipsis),
                   ),
                 ),
               ),
               const SizedBox(width: 8),
               Material(
-                color: TokyoNight.bgTertiary,
-                borderRadius: BorderRadius.circular(6),
+                color: t.bgTertiary, borderRadius: BorderRadius.circular(6),
                 child: InkWell(
-                  borderRadius: BorderRadius.circular(6),
-                  onTap: _pickAndUpload,
-                  child: const Padding(
-                    padding: EdgeInsets.all(8),
-                    child: Icon(Icons.upload_file, size: 20, color: TokyoNight.accent),
-                  ),
+                  borderRadius: BorderRadius.circular(6), onTap: _pickAndUpload,
+                  child: Padding(padding: const EdgeInsets.all(8), child: Icon(Icons.upload_file, size: 20, color: t.accent)),
                 ),
               ),
             ],
           ),
         ),
-        const Divider(height: 1, color: TokyoNight.border),
-        // File list
+        Divider(height: 1, color: t.border),
         Expanded(
           child: _loading
-              ? const Center(
-                  child: CircularProgressIndicator(color: TokyoNight.accent),
-                )
+              ? Center(child: CircularProgressIndicator(color: t.accent))
               : _error != null
-                  ? Center(
-                      child: Text(_error!,
-                          style: const TextStyle(color: TokyoNight.danger)),
-                    )
+                  ? Center(child: Text(_error!, style: TextStyle(color: t.danger)))
                   : ListView.builder(
                       itemCount: (_currentPath != '/' ? 1 : 0) + _entries.length,
                       itemBuilder: (ctx, i) {
-                        // Parent directory
                         if (_currentPath != '/' && i == 0) {
-                          final parentPath = _currentPath
-                                  .split('/')
-                                  .sublist(
-                                      0,
-                                      _currentPath.split('/').length - 1)
-                                  .join('/');
-                          return _buildEntry(
-                            name: '..',
-                            isDir: true,
-                            size: 0,
-                            onTap: () =>
-                                _navigate(parentPath.isEmpty ? '/' : parentPath),
-                          );
+                          final parentPath = _currentPath.split('/').sublist(0, _currentPath.split('/').length - 1).join('/');
+                          return _buildEntry(t, name: '..', isDir: true, size: 0,
+                            onTap: () => _navigate(parentPath.isEmpty ? '/' : parentPath));
                         }
                         final entry = _entries[i - (_currentPath != '/' ? 1 : 0)];
                         final name = entry['name'] as String;
                         final isDir = entry['is_dir'] == true;
                         final size = entry['size'] as int? ?? 0;
-                        final fullPath =
-                            '${_currentPath == '/' ? '/' : '$_currentPath/'}$name';
-                        return _buildEntry(
-                          name: name,
-                          isDir: isDir,
-                          size: size,
+                        final fullPath = '${_currentPath == '/' ? '/' : '$_currentPath/'}$name';
+                        return _buildEntry(t, name: name, isDir: isDir, size: size,
                           onTap: () {
-                            if (isDir) {
-                              _navigate(fullPath);
-                            } else {
-                              _startDownload(fullPath, name);
-                            }
+                            if (isDir) { _navigate(fullPath); }
+                            else if (_canPreview(name, size)) { _requestPreview(fullPath, name, size); }
+                            else { _startDownload(fullPath, name); }
                           },
+                          onLongPress: !isDir ? () => _startDownload(fullPath, name) : null,
+                          previewable: !isDir && _canPreview(name, size),
                         );
                       },
                     ),
@@ -339,44 +388,29 @@ class _FilesTabState extends State<FilesTab> {
     );
   }
 
-  Widget _buildEntry({
-    required String name,
-    required bool isDir,
-    required int size,
-    required VoidCallback onTap,
+  Widget _buildEntry(AppThemeData t, {
+    required String name, required bool isDir, required int size,
+    required VoidCallback onTap, VoidCallback? onLongPress, bool previewable = false,
   }) {
     return InkWell(
       onTap: onTap,
+      onLongPress: onLongPress,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        decoration: const BoxDecoration(
-          border: Border(bottom: BorderSide(color: TokyoNight.bgTertiary)),
-        ),
+        decoration: BoxDecoration(border: Border(bottom: BorderSide(color: t.bgTertiary))),
         child: Row(
           children: [
-            Text(
-              isDir ? '\u{1F4C1}' : '\u{1F4C4}',
-              style: const TextStyle(fontSize: 18),
-            ),
+            Text(isDir ? '\u{1F4C1}' : '\u{1F4C4}', style: const TextStyle(fontSize: 18)),
             const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                name,
-                style: TextStyle(
-                  color: isDir ? TokyoNight.accent : TokyoNight.textPrimary,
-                  fontSize: 14,
-                  fontWeight: isDir ? FontWeight.w500 : FontWeight.normal,
-                ),
+            Expanded(child: Text(name,
+              style: TextStyle(color: isDir ? t.accent : t.textPrimary, fontSize: 14,
+                fontWeight: isDir ? FontWeight.w500 : FontWeight.normal))),
+            if (previewable)
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: Icon(Icons.preview, size: 16, color: t.textMuted),
               ),
-            ),
-            if (!isDir)
-              Text(
-                _formatSize(size),
-                style: const TextStyle(
-                  color: TokyoNight.textMuted,
-                  fontSize: 12,
-                ),
-              ),
+            if (!isDir) Text(_formatSize(size), style: TextStyle(color: t.textMuted, fontSize: 12)),
           ],
         ),
       ),
@@ -386,12 +420,8 @@ class _FilesTabState extends State<FilesTab> {
   String _formatSize(int bytes) {
     if (bytes == 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB'];
-    int i = 0;
-    double val = bytes.toDouble();
-    while (val >= 1024 && i < units.length - 1) {
-      val /= 1024;
-      i++;
-    }
+    int i = 0; double val = bytes.toDouble();
+    while (val >= 1024 && i < units.length - 1) { val /= 1024; i++; }
     return '${val.toStringAsFixed(i > 0 ? 1 : 0)} ${units[i]}';
   }
 }
