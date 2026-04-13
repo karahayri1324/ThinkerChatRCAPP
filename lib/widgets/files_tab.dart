@@ -24,19 +24,21 @@ class _FilesTabState extends State<FilesTab> {
   bool _loading = false;
   String? _error;
   final Map<String, _DownloadState> _downloads = {};
-
-  // Preview state
   final Map<String, _DownloadState> _previews = {};
+  Timer? _loadTimeout;
 
   late void Function(Map<String, dynamic>) _listHandler;
   late void Function(Map<String, dynamic>) _downloadHandler;
   late void Function(Map<String, dynamic>) _uploadAckHandler;
+  late void Function(Map<String, dynamic>) _connHandler;
 
   static const _imageExts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'};
-  static const _textExts = {'.txt', '.log', '.md', '.json', '.yaml', '.yml',
-      '.xml', '.csv', '.ini', '.conf', '.cfg', '.sh', '.bash', '.py', '.js',
-      '.dart', '.html', '.css', '.toml', '.env', '.gitignore'};
-  static const _maxPreviewSize = 512 * 1024; // 512KB
+  static const _textExts = {
+    '.txt', '.log', '.md', '.json', '.yaml', '.yml',
+    '.xml', '.csv', '.ini', '.conf', '.cfg', '.sh', '.bash', '.py', '.js',
+    '.dart', '.html', '.css', '.toml', '.env', '.gitignore',
+  };
+  static const _maxPreviewSize = 512 * 1024;
 
   @override
   void initState() {
@@ -44,6 +46,7 @@ class _FilesTabState extends State<FilesTab> {
     _ws = context.read<WsService>();
 
     _listHandler = (msg) {
+      _loadTimeout?.cancel();
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       if (payload['error'] != null) {
         setState(() { _error = payload['error'] as String; _loading = false; });
@@ -58,7 +61,8 @@ class _FilesTabState extends State<FilesTab> {
           if (a['is_dir'] != true && b['is_dir'] == true) return 1;
           return (a['name'] as String).compareTo(b['name'] as String);
         });
-        _loading = false; _error = null;
+        _loading = false;
+        _error = null;
       });
     };
 
@@ -70,7 +74,6 @@ class _FilesTabState extends State<FilesTab> {
       final data = payload['data'] as String? ?? '';
       final done = payload['done'] == true;
 
-      // Check if it's a preview download
       final preview = _previews[path];
       if (preview != null) {
         preview.chunks[chunkIndex] = data;
@@ -94,15 +97,39 @@ class _FilesTabState extends State<FilesTab> {
       }
     };
 
+    // Re-request file list when WS reconnects
+    _connHandler = (_) {
+      if (mounted && !_loading) {
+        _navigate(_currentPath);
+      }
+    };
+
     _ws.on('file_list_res', _listHandler);
     _ws.on('file_download_chunk', _downloadHandler);
     _ws.on('file_upload_ack', _uploadAckHandler);
+    _ws.on('_connected', _connHandler);
+
     _navigate(_currentPath);
   }
 
   void _navigate(String path) {
+    if (!_ws.connected) {
+      setState(() { _error = 'Not connected to server'; _loading = false; });
+      return;
+    }
+    _loadTimeout?.cancel();
     setState(() { _loading = true; _error = null; });
     _ws.send('file_list_req', {'path': path});
+
+    // Timeout after 8 seconds
+    _loadTimeout = Timer(const Duration(seconds: 8), () {
+      if (mounted && _loading) {
+        setState(() {
+          _loading = false;
+          _error = 'Request timed out. Tap to retry.';
+        });
+      }
+    });
   }
 
   String _ext(String name) {
@@ -169,10 +196,7 @@ class _FilesTabState extends State<FilesTab> {
                 child: ElevatedButton.icon(
                   icon: const Icon(Icons.download, size: 18),
                   label: const Text('Download'),
-                  onPressed: () {
-                    Navigator.pop(ctx);
-                    _startDownload(remotePath, filename);
-                  },
+                  onPressed: () { Navigator.pop(ctx); _startDownload(remotePath, filename); },
                 ),
               ),
             ),
@@ -218,10 +242,7 @@ class _FilesTabState extends State<FilesTab> {
                 child: ElevatedButton.icon(
                   icon: const Icon(Icons.download, size: 18),
                   label: const Text('Download'),
-                  onPressed: () {
-                    Navigator.pop(ctx);
-                    _startDownload(remotePath, filename);
-                  },
+                  onPressed: () { Navigator.pop(ctx); _startDownload(remotePath, filename); },
                 ),
               ),
             ),
@@ -255,6 +276,7 @@ class _FilesTabState extends State<FilesTab> {
   }
 
   void _startDownload(String fullPath, String filename) {
+    if (!_ws.connected) return;
     final t = context.read<ThemeService>().current;
     _downloads[fullPath] = _DownloadState(filename);
     _ws.send('file_download_req', {'path': fullPath});
@@ -264,6 +286,7 @@ class _FilesTabState extends State<FilesTab> {
   }
 
   Future<void> _pickAndUpload() async {
+    if (!_ws.connected) return;
     final t = context.read<ThemeService>().current;
     final result = await FilePicker.platform.pickFiles(allowMultiple: true);
     if (result == null) return;
@@ -316,22 +339,37 @@ class _FilesTabState extends State<FilesTab> {
 
   @override
   void dispose() {
+    _loadTimeout?.cancel();
     _ws.off('file_list_res', _listHandler);
     _ws.off('file_download_chunk', _downloadHandler);
     _ws.off('file_upload_ack', _uploadAckHandler);
+    _ws.off('_connected', _connHandler);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final t = context.watch<ThemeService>().current;
+    final wsConnected = context.watch<WsService>().connected;
+
     return Column(
       children: [
+        // Path bar
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           color: t.bgSecondary,
           child: Row(
             children: [
+              // Refresh button
+              Material(
+                color: t.bgTertiary, borderRadius: BorderRadius.circular(6),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: () => _navigate(_currentPath),
+                  child: Padding(padding: const EdgeInsets.all(8), child: Icon(Icons.refresh, size: 20, color: t.textMuted)),
+                ),
+              ),
+              const SizedBox(width: 8),
               Expanded(
                 child: GestureDetector(
                   onTap: _showPathDialog,
@@ -354,37 +392,68 @@ class _FilesTabState extends State<FilesTab> {
           ),
         ),
         Divider(height: 1, color: t.border),
+        // Content
         Expanded(
-          child: _loading
-              ? Center(child: CircularProgressIndicator(color: t.accent))
-              : _error != null
-                  ? Center(child: Text(_error!, style: TextStyle(color: t.danger)))
-                  : ListView.builder(
-                      itemCount: (_currentPath != '/' ? 1 : 0) + _entries.length,
-                      itemBuilder: (ctx, i) {
-                        if (_currentPath != '/' && i == 0) {
-                          final parentPath = _currentPath.split('/').sublist(0, _currentPath.split('/').length - 1).join('/');
-                          return _buildEntry(t, name: '..', isDir: true, size: 0,
-                            onTap: () => _navigate(parentPath.isEmpty ? '/' : parentPath));
-                        }
-                        final entry = _entries[i - (_currentPath != '/' ? 1 : 0)];
-                        final name = entry['name'] as String;
-                        final isDir = entry['is_dir'] == true;
-                        final size = entry['size'] as int? ?? 0;
-                        final fullPath = '${_currentPath == '/' ? '/' : '$_currentPath/'}$name';
-                        return _buildEntry(t, name: name, isDir: isDir, size: size,
-                          onTap: () {
-                            if (isDir) { _navigate(fullPath); }
-                            else if (_canPreview(name, size)) { _requestPreview(fullPath, name, size); }
-                            else { _startDownload(fullPath, name); }
-                          },
-                          onLongPress: !isDir ? () => _startDownload(fullPath, name) : null,
-                          previewable: !isDir && _canPreview(name, size),
-                        );
-                      },
-                    ),
+          child: !wsConnected
+              ? _buildStatusView(t, Icons.cloud_off, 'Not connected', 'Waiting for server connection...', null)
+              : _loading
+                  ? Center(child: CircularProgressIndicator(color: t.accent))
+                  : _error != null
+                      ? _buildStatusView(t, Icons.error_outline, 'Error', _error!, () => _navigate(_currentPath))
+                      : _entries.isEmpty && _currentPath == '/'
+                          ? _buildStatusView(t, Icons.folder_open, 'Empty', 'No files found', () => _navigate(_currentPath))
+                          : ListView.builder(
+                              itemCount: (_currentPath != '/' ? 1 : 0) + _entries.length,
+                              itemBuilder: (ctx, i) {
+                                if (_currentPath != '/' && i == 0) {
+                                  final parts = _currentPath.split('/');
+                                  parts.removeLast();
+                                  final parentPath = parts.join('/');
+                                  return _buildEntry(t, name: '..', isDir: true, size: 0,
+                                    onTap: () => _navigate(parentPath.isEmpty ? '/' : parentPath));
+                                }
+                                final entry = _entries[i - (_currentPath != '/' ? 1 : 0)];
+                                final name = entry['name'] as String;
+                                final isDir = entry['is_dir'] == true;
+                                final size = entry['size'] as int? ?? 0;
+                                final fullPath = '${_currentPath == '/' ? '/' : '$_currentPath/'}$name';
+                                return _buildEntry(t, name: name, isDir: isDir, size: size,
+                                  onTap: () {
+                                    if (isDir) { _navigate(fullPath); }
+                                    else if (_canPreview(name, size)) { _requestPreview(fullPath, name, size); }
+                                    else { _startDownload(fullPath, name); }
+                                  },
+                                  onLongPress: !isDir ? () => _startDownload(fullPath, name) : null,
+                                  previewable: !isDir && _canPreview(name, size),
+                                );
+                              },
+                            ),
         ),
       ],
+    );
+  }
+
+  Widget _buildStatusView(AppThemeData t, IconData icon, String title, String subtitle, VoidCallback? onRetry) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 48, color: t.textMuted),
+          const SizedBox(height: 12),
+          Text(title, style: TextStyle(color: t.textPrimary, fontSize: 16, fontWeight: FontWeight.w500)),
+          const SizedBox(height: 4),
+          Text(subtitle, style: TextStyle(color: t.textMuted, fontSize: 13), textAlign: TextAlign.center),
+          if (onRetry != null) ...[
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.refresh, size: 18),
+              label: const Text('Retry'),
+              onPressed: onRetry,
+              style: ElevatedButton.styleFrom(backgroundColor: t.accent, foregroundColor: t.bgPrimary),
+            ),
+          ],
+        ],
+      ),
     );
   }
 
@@ -400,7 +469,11 @@ class _FilesTabState extends State<FilesTab> {
         decoration: BoxDecoration(border: Border(bottom: BorderSide(color: t.bgTertiary))),
         child: Row(
           children: [
-            Text(isDir ? '\u{1F4C1}' : '\u{1F4C4}', style: const TextStyle(fontSize: 18)),
+            Icon(
+              isDir ? Icons.folder : _fileIcon(name),
+              size: 22,
+              color: isDir ? t.accent : t.textMuted,
+            ),
             const SizedBox(width: 10),
             Expanded(child: Text(name,
               style: TextStyle(color: isDir ? t.accent : t.textPrimary, fontSize: 14,
@@ -415,6 +488,17 @@ class _FilesTabState extends State<FilesTab> {
         ),
       ),
     );
+  }
+
+  IconData _fileIcon(String name) {
+    final ext = _ext(name);
+    if (_imageExts.contains(ext)) return Icons.image;
+    if (_textExts.contains(ext)) return Icons.description;
+    if ({'.zip', '.tar', '.gz', '.rar', '.7z'}.contains(ext)) return Icons.archive;
+    if ({'.mp4', '.mkv', '.avi', '.mov'}.contains(ext)) return Icons.movie;
+    if ({'.mp3', '.wav', '.flac', '.ogg'}.contains(ext)) return Icons.audiotrack;
+    if ({'.pdf'}.contains(ext)) return Icons.picture_as_pdf;
+    return Icons.insert_drive_file;
   }
 
   String _formatSize(int bytes) {

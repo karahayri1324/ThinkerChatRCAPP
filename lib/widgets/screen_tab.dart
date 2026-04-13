@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../services/ws_service.dart';
 import '../services/theme_service.dart';
@@ -18,18 +18,23 @@ class _ScreenTabState extends State<ScreenTab> {
   late WsService _ws;
   bool _streaming = false;
   bool _available = false;
+  bool _checking = true;
   double _fps = 15;
   double _quality = 50;
   ui.Image? _currentFrame;
   int _naturalWidth = 0;
   int _naturalHeight = 0;
   bool _decoding = false;
+  bool _showControls = true;
 
   final TransformationController _transformCtrl = TransformationController();
+  final TextEditingController _typeCtrl = TextEditingController();
+  final FocusNode _typeFocusNode = FocusNode();
 
   late void Function(Map<String, dynamic>) _frameHandler;
   late void Function(Map<String, dynamic>) _checkHandler;
   late void Function(Map<String, dynamic>) _errorHandler;
+  late void Function(Map<String, dynamic>) _connHandler;
 
   final GlobalKey _canvasKey = GlobalKey();
 
@@ -49,20 +54,44 @@ class _ScreenTabState extends State<ScreenTab> {
 
     _checkHandler = (msg) {
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
-      setState(() => _available = payload['available'] == true);
+      setState(() {
+        _available = payload['available'] == true;
+        _checking = false;
+      });
     };
 
     _errorHandler = (msg) {
       setState(() => _streaming = false);
+      if (mounted) {
+        final t = context.read<ThemeService>().current;
+        final message = (msg['payload'] as Map<String, dynamic>?)?['message'] ?? 'Screen error';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message.toString()), backgroundColor: t.danger),
+        );
+      }
+    };
+
+    _connHandler = (_) {
+      if (mounted) {
+        setState(() => _checking = true);
+        _ws.send('screen_check');
+      }
     };
 
     _ws.on('screen_frame', _frameHandler);
     _ws.on('screen_check_res', _checkHandler);
     _ws.on('screen_error', _errorHandler);
-    _ws.send('screen_check');
+    _ws.on('_connected', _connHandler);
+
+    if (_ws.connected) {
+      _ws.send('screen_check');
+    } else {
+      _checking = false;
+    }
   }
 
   Future<void> _decodeFrame(String b64data) async {
+    if (b64data.isEmpty) return;
     _decoding = true;
     try {
       final bytes = base64Decode(b64data);
@@ -83,6 +112,7 @@ class _ScreenTabState extends State<ScreenTab> {
   }
 
   void _start() {
+    if (!_ws.connected) return;
     _ws.send('screen_start', {
       'fps': _fps.toInt(),
       'quality': _quality.toInt(),
@@ -100,7 +130,6 @@ class _ScreenTabState extends State<ScreenTab> {
     if (_naturalWidth == 0 || _naturalHeight == 0) return Offset.zero;
     final box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null) return Offset.zero;
-    // Account for InteractiveViewer transform
     final matrix = _transformCtrl.value;
     final inverted = Matrix4.inverted(matrix);
     final transformed = MatrixUtils.transformPoint(inverted, local);
@@ -132,117 +161,34 @@ class _ScreenTabState extends State<ScreenTab> {
     });
   }
 
+  void _onDoubleTap() {
+    if (!_streaming) return;
+    // Double-click at center of last known position
+    _ws.send('screen_input', {
+      'input_type': 'mouse_dblclick',
+      'data': {'x': _naturalWidth ~/ 2, 'y': _naturalHeight ~/ 2, 'button': 1},
+    });
+  }
+
+  void _sendRemoteKey(String key) {
+    if (!_streaming) return;
+    HapticFeedback.lightImpact();
+    _ws.send('screen_input', {
+      'input_type': 'key_press',
+      'data': {'key': key},
+    });
+  }
+
+  void _sendRemoteText(String text) {
+    if (!_streaming || text.isEmpty) return;
+    _ws.send('screen_input', {
+      'input_type': 'key_type',
+      'data': {'text': text},
+    });
+  }
+
   void _resetZoom() {
     _transformCtrl.value = Matrix4.identity();
-  }
-
-  @override
-  void dispose() {
-    _ws.off('screen_frame', _frameHandler);
-    _ws.off('screen_check_res', _checkHandler);
-    _ws.off('screen_error', _errorHandler);
-    _currentFrame?.dispose();
-    _transformCtrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final t = context.watch<ThemeService>().current;
-    return Column(
-      children: [
-        // Controls
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          color: t.bgSecondary,
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  Text('FPS: ${_fps.toInt()}',
-                      style: TextStyle(color: t.textMuted, fontSize: 12)),
-                  Expanded(
-                    child: Slider(
-                      value: _fps, min: 1, max: 60,
-                      activeColor: t.accent,
-                      onChanged: (v) {
-                        setState(() => _fps = v);
-                        if (_streaming) _sendSettings();
-                      },
-                    ),
-                  ),
-                  Text('Q: ${_quality.toInt()}',
-                      style: TextStyle(color: t.textMuted, fontSize: 12)),
-                  Expanded(
-                    child: Slider(
-                      value: _quality, min: 10, max: 95,
-                      activeColor: t.accent,
-                      onChanged: (v) {
-                        setState(() => _quality = v);
-                        if (_streaming) _sendSettings();
-                      },
-                    ),
-                  ),
-                ],
-              ),
-              Row(
-                children: [
-                  ElevatedButton(
-                    onPressed: !_available ? null : (_streaming ? _stop : _start),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _streaming ? t.danger : t.accent,
-                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
-                    ),
-                    child: Text(_streaming ? 'Stop' : 'Start'),
-                  ),
-                  const SizedBox(width: 8),
-                  if (_streaming)
-                    IconButton(
-                      icon: const Icon(Icons.zoom_out_map, size: 20),
-                      color: t.textMuted,
-                      tooltip: 'Reset zoom',
-                      onPressed: _resetZoom,
-                    ),
-                  const Spacer(),
-                  Text(
-                    !_available ? 'Not available'
-                        : _streaming ? 'Pinch to zoom' : 'Ready',
-                    style: TextStyle(color: t.textMuted, fontSize: 12),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-        Divider(height: 1, color: t.border),
-        // Canvas with pinch-to-zoom
-        Expanded(
-          child: Container(
-            color: Colors.black,
-            child: _currentFrame == null
-                ? Center(child: Text('No frame', style: TextStyle(color: t.textMuted)))
-                : InteractiveViewer(
-                    transformationController: _transformCtrl,
-                    minScale: 1.0,
-                    maxScale: 5.0,
-                    panEnabled: true,
-                    scaleEnabled: true,
-                    child: Center(
-                      child: GestureDetector(
-                        onTapDown: _onTapDown,
-                        onTapUp: _onTapUp,
-                        child: CustomPaint(
-                          key: _canvasKey,
-                          painter: _FramePainter(_currentFrame!),
-                          size: _calculateSize(context),
-                        ),
-                      ),
-                    ),
-                  ),
-          ),
-        ),
-      ],
-    );
   }
 
   void _sendSettings() {
@@ -251,6 +197,280 @@ class _ScreenTabState extends State<ScreenTab> {
       'quality': _quality.toInt(),
       'max_width': 1920,
     });
+  }
+
+  @override
+  void dispose() {
+    _ws.off('screen_frame', _frameHandler);
+    _ws.off('screen_check_res', _checkHandler);
+    _ws.off('screen_error', _errorHandler);
+    _ws.off('_connected', _connHandler);
+    _currentFrame?.dispose();
+    _transformCtrl.dispose();
+    _typeCtrl.dispose();
+    _typeFocusNode.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = context.watch<ThemeService>().current;
+    final wsConnected = context.watch<WsService>().connected;
+
+    return Column(
+      children: [
+        // Controls (collapsible)
+        if (_showControls) _buildControls(t, wsConnected),
+        Divider(height: 1, color: t.border),
+        // Canvas
+        Expanded(
+          child: !wsConnected
+              ? _buildStatus(t, Icons.cloud_off, 'Not connected')
+              : _checking
+                  ? Center(child: CircularProgressIndicator(color: t.accent))
+                  : !_available
+                      ? _buildStatus(t, Icons.desktop_access_disabled, 'Screen sharing not available on this agent')
+                      : _currentFrame == null
+                          ? _buildStatus(t, _streaming ? Icons.hourglass_empty : Icons.desktop_windows, _streaming ? 'Waiting for frames...' : 'Tap Start to begin')
+                          : GestureDetector(
+                              onTap: () => setState(() => _showControls = !_showControls),
+                              child: Container(
+                                color: Colors.black,
+                                child: InteractiveViewer(
+                                  transformationController: _transformCtrl,
+                                  minScale: 1.0,
+                                  maxScale: 5.0,
+                                  panEnabled: true,
+                                  scaleEnabled: true,
+                                  child: Center(
+                                    child: GestureDetector(
+                                      onTapDown: _onTapDown,
+                                      onTapUp: _onTapUp,
+                                      onDoubleTap: _onDoubleTap,
+                                      child: CustomPaint(
+                                        key: _canvasKey,
+                                        painter: _FramePainter(_currentFrame!),
+                                        size: _calculateSize(context),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+        ),
+        // Remote keyboard toolbar (when streaming)
+        if (_streaming) _buildRemoteKeybar(t),
+      ],
+    );
+  }
+
+  Widget _buildControls(AppThemeData t, bool wsConnected) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      color: t.bgSecondary,
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Text('FPS: ${_fps.toInt()}', style: TextStyle(color: t.textMuted, fontSize: 12)),
+              Expanded(
+                child: Slider(
+                  value: _fps, min: 1, max: 60,
+                  activeColor: t.accent,
+                  onChanged: (v) {
+                    setState(() => _fps = v);
+                    if (_streaming) _sendSettings();
+                  },
+                ),
+              ),
+              Text('Q: ${_quality.toInt()}', style: TextStyle(color: t.textMuted, fontSize: 12)),
+              Expanded(
+                child: Slider(
+                  value: _quality, min: 10, max: 95,
+                  activeColor: t.accent,
+                  onChanged: (v) {
+                    setState(() => _quality = v);
+                    if (_streaming) _sendSettings();
+                  },
+                ),
+              ),
+            ],
+          ),
+          Row(
+            children: [
+              ElevatedButton(
+                onPressed: (!wsConnected || !_available) ? null : (_streaming ? _stop : _start),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _streaming ? t.danger : t.accent,
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+                ),
+                child: Text(_streaming ? 'Stop' : 'Start'),
+              ),
+              const SizedBox(width: 8),
+              if (_streaming)
+                IconButton(
+                  icon: const Icon(Icons.zoom_out_map, size: 20),
+                  color: t.textMuted,
+                  tooltip: 'Reset zoom',
+                  onPressed: _resetZoom,
+                ),
+              if (!_available && wsConnected)
+                TextButton.icon(
+                  icon: Icon(Icons.refresh, size: 16, color: t.textMuted),
+                  label: Text('Re-check', style: TextStyle(color: t.textMuted, fontSize: 12)),
+                  onPressed: () {
+                    setState(() => _checking = true);
+                    _ws.send('screen_check');
+                  },
+                ),
+              const Spacer(),
+              Text(
+                !wsConnected ? 'Offline'
+                    : !_available ? 'Not available'
+                    : _streaming ? 'Tap image to toggle controls' : 'Ready',
+                style: TextStyle(color: t.textMuted, fontSize: 11),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRemoteKeybar(AppThemeData t) {
+    return Container(
+      color: t.bgSecondary,
+      child: SafeArea(
+        top: false,
+        child: Column(
+          children: [
+            // Text input for typing on remote
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _typeCtrl,
+                      focusNode: _typeFocusNode,
+                      style: TextStyle(color: t.textPrimary, fontSize: 14),
+                      decoration: InputDecoration(
+                        hintText: 'Type text to send...',
+                        hintStyle: TextStyle(color: t.textMuted.withOpacity( 0.5)),
+                        border: InputBorder.none,
+                        isDense: true,
+                        contentPadding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+                      ),
+                      textInputAction: TextInputAction.send,
+                      onSubmitted: (text) {
+                        _sendRemoteText(text);
+                        _sendRemoteKey('Return');
+                        _typeCtrl.clear();
+                        _typeFocusNode.requestFocus();
+                      },
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.send, size: 20, color: t.accent),
+                    onPressed: () {
+                      _sendRemoteText(_typeCtrl.text);
+                      _sendRemoteKey('Return');
+                      _typeCtrl.clear();
+                    },
+                  ),
+                ],
+              ),
+            ),
+            // Key shortcuts
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+              child: Row(
+                children: [
+                  _remoteKeyBtn(t, 'Enter', 'Return'),
+                  _remoteKeyBtn(t, 'Esc', 'Escape'),
+                  _remoteKeyBtn(t, 'Tab', 'Tab'),
+                  _remoteKeyBtn(t, 'BS', 'BackSpace'),
+                  _remoteKeyBtn(t, 'Del', 'Delete'),
+                  _remoteKeyBtn(t, 'Space', 'space'),
+                  _remoteKeyBtn(t, 'Ctrl+C', 'ctrl+c'),
+                  _remoteKeyBtn(t, 'Ctrl+V', 'ctrl+v'),
+                  _remoteKeyBtn(t, 'Ctrl+Z', 'ctrl+z'),
+                  _remoteKeyBtn(t, 'Ctrl+A', 'ctrl+a'),
+                  _remoteKeyBtn(t, 'Alt+Tab', 'alt+Tab'),
+                  _remoteKeyBtn(t, 'Alt+F4', 'alt+F4'),
+                  _remoteIconBtn(t, Icons.arrow_upward, 'Up'),
+                  _remoteIconBtn(t, Icons.arrow_downward, 'Down'),
+                  _remoteIconBtn(t, Icons.arrow_back, 'Left'),
+                  _remoteIconBtn(t, Icons.arrow_forward, 'Right'),
+                  _remoteKeyBtn(t, 'Home', 'Home'),
+                  _remoteKeyBtn(t, 'End', 'End'),
+                  _remoteKeyBtn(t, 'PgUp', 'Prior'),
+                  _remoteKeyBtn(t, 'PgDn', 'Next'),
+                  _remoteKeyBtn(t, 'F5', 'F5'),
+                  _remoteKeyBtn(t, 'F11', 'F11'),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _remoteKeyBtn(AppThemeData t, String label, String key) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: Material(
+        color: t.bgTertiary,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: () => _sendRemoteKey(key),
+          child: Container(
+            constraints: const BoxConstraints(minWidth: 40, minHeight: 32),
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            alignment: Alignment.center,
+            child: Text(label, style: TextStyle(color: t.textPrimary, fontSize: 11, fontFamily: 'monospace')),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _remoteIconBtn(AppThemeData t, IconData icon, String key) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: Material(
+        color: t.bgTertiary,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: () => _sendRemoteKey(key),
+          child: Container(
+            constraints: const BoxConstraints(minWidth: 36, minHeight: 32),
+            alignment: Alignment.center,
+            child: Icon(icon, size: 16, color: t.textPrimary),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatus(AppThemeData t, IconData icon, String text) {
+    return Container(
+      color: Colors.black,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 48, color: t.textMuted),
+            const SizedBox(height: 12),
+            Text(text, style: TextStyle(color: t.textMuted, fontSize: 14), textAlign: TextAlign.center),
+          ],
+        ),
+      ),
+    );
   }
 
   Size _calculateSize(BuildContext context) {
