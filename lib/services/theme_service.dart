@@ -145,14 +145,18 @@ class AppThemeData {
 
 class ThemeService extends ChangeNotifier {
   static const _key = 'selected_theme';
+  static const _fontSizeKey = 'terminal_font_size';
   String _currentThemeName = 'Tokyo Night';
+  double _terminalFontSize = 13.0;
 
   String get currentThemeName => _currentThemeName;
   AppThemeData get current => themes[_currentThemeName] ?? themes['Tokyo Night']!;
+  double get terminalFontSize => _terminalFontSize;
 
   Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
     _currentThemeName = prefs.getString(_key) ?? 'Tokyo Night';
+    _terminalFontSize = prefs.getDouble(_fontSizeKey) ?? 13.0;
     notifyListeners();
   }
 
@@ -161,6 +165,13 @@ class ThemeService extends ChangeNotifier {
     _currentThemeName = name;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_key, name);
+    notifyListeners();
+  }
+
+  Future<void> setTerminalFontSize(double size) async {
+    _terminalFontSize = size.clamp(8.0, 24.0);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_fontSizeKey, _terminalFontSize);
     notifyListeners();
   }
 

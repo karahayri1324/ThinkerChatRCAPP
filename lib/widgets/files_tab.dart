@@ -9,6 +9,7 @@ import 'package:open_file/open_file.dart';
 import 'package:file_picker/file_picker.dart';
 import '../services/ws_service.dart';
 import '../services/theme_service.dart';
+import 'connection_banner.dart';
 
 class FilesTab extends StatefulWidget {
   const FilesTab({super.key});
@@ -26,6 +27,9 @@ class _FilesTabState extends State<FilesTab> {
   final Map<String, _DownloadState> _downloads = {};
   final Map<String, _DownloadState> _previews = {};
   Timer? _loadTimeout;
+
+  // Upload progress tracking
+  final Map<String, _UploadProgress> _uploadProgress = {};
 
   late void Function(Map<String, dynamic>) _listHandler;
   late void Function(Map<String, dynamic>) _downloadHandler;
@@ -47,6 +51,7 @@ class _FilesTabState extends State<FilesTab> {
 
     _listHandler = (msg) {
       _loadTimeout?.cancel();
+      if (!mounted) return;
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       if (payload['error'] != null) {
         setState(() { _error = payload['error'] as String; _loading = false; });
@@ -67,16 +72,20 @@ class _FilesTabState extends State<FilesTab> {
     };
 
     _downloadHandler = (msg) {
+      if (!mounted) return;
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       final path = payload['path'] as String? ?? '';
       final chunkIndex = payload['chunk_index'] as int?;
       if (chunkIndex == null) return;
+      final totalChunks = payload['total_chunks'] as int?;
       final data = payload['data'] as String? ?? '';
       final done = payload['done'] == true;
 
+      // Check if preview
       final preview = _previews[path];
       if (preview != null) {
         preview.chunks[chunkIndex] = data;
+        if (totalChunks != null) preview.totalChunks = totalChunks;
         if (done) _finishPreview(path, preview);
         return;
       }
@@ -84,24 +93,27 @@ class _FilesTabState extends State<FilesTab> {
       final dl = _downloads[path];
       if (dl == null) return;
       dl.chunks[chunkIndex] = data;
+      if (totalChunks != null) dl.totalChunks = totalChunks;
+      if (mounted) setState(() {}); // update progress
       if (done) _finishDownload(path, dl);
     };
 
     _uploadAckHandler = (msg) {
+      if (!mounted) return;
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
-      if (payload['success'] != true && mounted) {
+      final path = payload['path'] as String?;
+      if (path != null) _uploadProgress.remove(path);
+      if (payload['success'] != true) {
         final t = context.read<ThemeService>().current;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Upload error: ${payload['error']}'), backgroundColor: t.danger),
         );
       }
+      setState(() {});
     };
 
-    // Re-request file list when WS reconnects
     _connHandler = (_) {
-      if (mounted && !_loading) {
-        _navigate(_currentPath);
-      }
+      if (mounted && !_loading) _navigate(_currentPath);
     };
 
     _ws.on('file_list_res', _listHandler);
@@ -121,15 +133,17 @@ class _FilesTabState extends State<FilesTab> {
     setState(() { _loading = true; _error = null; });
     _ws.send('file_list_req', {'path': path});
 
-    // Timeout after 8 seconds
     _loadTimeout = Timer(const Duration(seconds: 8), () {
       if (mounted && _loading) {
-        setState(() {
-          _loading = false;
-          _error = 'Request timed out. Tap to retry.';
-        });
+        setState(() { _loading = false; _error = 'Request timed out'; });
       }
     });
+  }
+
+  Future<void> _refresh() async {
+    _navigate(_currentPath);
+    // Wait for response or timeout
+    await Future.delayed(const Duration(milliseconds: 500));
   }
 
   String _ext(String name) {
@@ -155,7 +169,6 @@ class _FilesTabState extends State<FilesTab> {
       final combined = sortedKeys.map((k) => dl.chunks[k]!).join('');
       final bytes = base64Decode(combined);
       final ext = _ext(dl.filename);
-
       if (_imageExts.contains(ext)) {
         _showImagePreview(dl.filename, bytes, path);
       } else {
@@ -253,7 +266,6 @@ class _FilesTabState extends State<FilesTab> {
   }
 
   Future<void> _finishDownload(String path, _DownloadState dl) async {
-    final t = context.read<ThemeService>().current;
     try {
       final sortedKeys = dl.chunks.keys.toList()..sort();
       final combined = sortedKeys.map((k) => dl.chunks[k]!).join('');
@@ -263,13 +275,18 @@ class _FilesTabState extends State<FilesTab> {
       await file.writeAsBytes(bytes);
       _downloads.remove(path);
       if (mounted) {
+        final t = context.read<ThemeService>().current;
+        setState(() {});
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text('Downloaded ${dl.filename}'), backgroundColor: t.success,
           action: SnackBarAction(label: 'Open', textColor: t.bgPrimary, onPressed: () => OpenFile.open(file.path)),
         ));
       }
     } catch (e) {
+      _downloads.remove(path);
       if (mounted) {
+        final t = context.read<ThemeService>().current;
+        setState(() {});
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Download error: $e'), backgroundColor: t.danger));
       }
     }
@@ -280,6 +297,7 @@ class _FilesTabState extends State<FilesTab> {
     final t = context.read<ThemeService>().current;
     _downloads[fullPath] = _DownloadState(filename);
     _ws.send('file_download_req', {'path': fullPath});
+    setState(() {});
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('Downloading $filename...'), backgroundColor: t.bgSecondary),
     );
@@ -298,6 +316,10 @@ class _FilesTabState extends State<FilesTab> {
       final targetPath = '${_currentPath == '/' ? '/' : '$_currentPath/'}$filename';
       const chunkSize = 524288;
       final totalChunks = (bytes.length / chunkSize).ceil().clamp(1, 999999);
+
+      _uploadProgress[targetPath] = _UploadProgress(filename, totalChunks);
+      setState(() {});
+
       _ws.send('file_upload_start', {'path': targetPath, 'total_size': bytes.length, 'total_chunks': totalChunks});
       for (int i = 0; i < totalChunks; i++) {
         final start = i * chunkSize;
@@ -307,8 +329,12 @@ class _FilesTabState extends State<FilesTab> {
           'data': base64Encode(bytes.sublist(start, end)),
           'done': i == totalChunks - 1,
         });
+        _uploadProgress[targetPath]?.sentChunks = i + 1;
+        if (mounted && i % 5 == 0) setState(() {});
       }
       if (mounted) {
+        _uploadProgress.remove(targetPath);
+        setState(() {});
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Uploaded $filename'), backgroundColor: t.success));
       }
     }
@@ -334,7 +360,7 @@ class _FilesTabState extends State<FilesTab> {
           TextButton(onPressed: () { Navigator.pop(ctx); _navigate(ctrl.text); }, child: const Text('Go')),
         ],
       ),
-    );
+    ).then((_) => ctrl.dispose());
   }
 
   @override
@@ -350,17 +376,18 @@ class _FilesTabState extends State<FilesTab> {
   @override
   Widget build(BuildContext context) {
     final t = context.watch<ThemeService>().current;
-    final wsConnected = context.watch<WsService>().connected;
 
     return Column(
       children: [
+        const ConnectionBanner(),
+        // Transfer progress bars
+        ..._buildTransferBars(t),
         // Path bar
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           color: t.bgSecondary,
           child: Row(
             children: [
-              // Refresh button
               Material(
                 color: t.bgTertiary, borderRadius: BorderRadius.circular(6),
                 child: InkWell(
@@ -392,16 +419,25 @@ class _FilesTabState extends State<FilesTab> {
           ),
         ),
         Divider(height: 1, color: t.border),
-        // Content
+        // Content with pull-to-refresh
         Expanded(
-          child: !wsConnected
-              ? _buildStatusView(t, Icons.cloud_off, 'Not connected', 'Waiting for server connection...', null)
-              : _loading
-                  ? Center(child: CircularProgressIndicator(color: t.accent))
-                  : _error != null
-                      ? _buildStatusView(t, Icons.error_outline, 'Error', _error!, () => _navigate(_currentPath))
-                      : _entries.isEmpty && _currentPath == '/'
-                          ? _buildStatusView(t, Icons.folder_open, 'Empty', 'No files found', () => _navigate(_currentPath))
+          child: _loading
+              ? Center(child: CircularProgressIndicator(color: t.accent))
+              : _error != null
+                  ? _buildStatusView(t, Icons.error_outline, 'Error', _error!, () => _navigate(_currentPath))
+                  : RefreshIndicator(
+                      onRefresh: _refresh,
+                      color: t.accent,
+                      backgroundColor: t.bgSecondary,
+                      child: _entries.isEmpty
+                          ? ListView(
+                              children: [
+                                SizedBox(
+                                  height: 300,
+                                  child: _buildStatusView(t, Icons.folder_open, 'Empty', 'No files found', () => _navigate(_currentPath)),
+                                ),
+                              ],
+                            )
                           : ListView.builder(
                               itemCount: (_currentPath != '/' ? 1 : 0) + _entries.length,
                               itemBuilder: (ctx, i) {
@@ -417,6 +453,7 @@ class _FilesTabState extends State<FilesTab> {
                                 final isDir = entry['is_dir'] == true;
                                 final size = entry['size'] as int? ?? 0;
                                 final fullPath = '${_currentPath == '/' ? '/' : '$_currentPath/'}$name';
+                                final isDownloading = _downloads.containsKey(fullPath);
                                 return _buildEntry(t, name: name, isDir: isDir, size: size,
                                   onTap: () {
                                     if (isDir) { _navigate(fullPath); }
@@ -425,12 +462,41 @@ class _FilesTabState extends State<FilesTab> {
                                   },
                                   onLongPress: !isDir ? () => _startDownload(fullPath, name) : null,
                                   previewable: !isDir && _canPreview(name, size),
+                                  downloading: isDownloading,
+                                  downloadProgress: isDownloading ? _downloads[fullPath]!.progress : null,
                                 );
                               },
                             ),
+                    ),
         ),
       ],
     );
+  }
+
+  List<Widget> _buildTransferBars(AppThemeData t) {
+    final bars = <Widget>[];
+    for (final up in _uploadProgress.entries) {
+      final progress = up.value.totalChunks > 0 ? up.value.sentChunks / up.value.totalChunks : 0.0;
+      bars.add(Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        color: t.accent.withOpacity(0.1),
+        child: Row(
+          children: [
+            Icon(Icons.upload, size: 14, color: t.accent),
+            const SizedBox(width: 8),
+            Expanded(child: Text(up.value.filename, style: TextStyle(color: t.textPrimary, fontSize: 11), overflow: TextOverflow.ellipsis)),
+            const SizedBox(width: 8),
+            SizedBox(
+              width: 60,
+              child: LinearProgressIndicator(value: progress, backgroundColor: t.bgTertiary, color: t.accent),
+            ),
+            const SizedBox(width: 8),
+            Text('${(progress * 100).toInt()}%', style: TextStyle(color: t.textMuted, fontSize: 11)),
+          ],
+        ),
+      ));
+    }
+    return bars;
   }
 
   Widget _buildStatusView(AppThemeData t, IconData icon, String title, String subtitle, VoidCallback? onRetry) {
@@ -460,6 +526,7 @@ class _FilesTabState extends State<FilesTab> {
   Widget _buildEntry(AppThemeData t, {
     required String name, required bool isDir, required int size,
     required VoidCallback onTap, VoidCallback? onLongPress, bool previewable = false,
+    bool downloading = false, double? downloadProgress,
   }) {
     return InkWell(
       onTap: onTap,
@@ -467,23 +534,39 @@ class _FilesTabState extends State<FilesTab> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         decoration: BoxDecoration(border: Border(bottom: BorderSide(color: t.bgTertiary))),
-        child: Row(
+        child: Column(
           children: [
-            Icon(
-              isDir ? Icons.folder : _fileIcon(name),
-              size: 22,
-              color: isDir ? t.accent : t.textMuted,
+            Row(
+              children: [
+                Icon(
+                  isDir ? Icons.folder : _fileIcon(name),
+                  size: 22,
+                  color: isDir ? t.accent : t.textMuted,
+                ),
+                const SizedBox(width: 10),
+                Expanded(child: Text(name,
+                  style: TextStyle(color: isDir ? t.accent : t.textPrimary, fontSize: 14,
+                    fontWeight: isDir ? FontWeight.w500 : FontWeight.normal))),
+                if (downloading)
+                  SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: t.accent))
+                else if (previewable)
+                  Icon(Icons.preview, size: 16, color: t.textMuted),
+                if (!isDir && !downloading) ...[
+                  const SizedBox(width: 8),
+                  Text(_formatSize(size), style: TextStyle(color: t.textMuted, fontSize: 12)),
+                ],
+              ],
             ),
-            const SizedBox(width: 10),
-            Expanded(child: Text(name,
-              style: TextStyle(color: isDir ? t.accent : t.textPrimary, fontSize: 14,
-                fontWeight: isDir ? FontWeight.w500 : FontWeight.normal))),
-            if (previewable)
+            if (downloading && downloadProgress != null)
               Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: Icon(Icons.preview, size: 16, color: t.textMuted),
+                padding: const EdgeInsets.only(top: 6),
+                child: LinearProgressIndicator(
+                  value: downloadProgress,
+                  backgroundColor: t.bgTertiary,
+                  color: t.accent,
+                  minHeight: 3,
+                ),
               ),
-            if (!isDir) Text(_formatSize(size), style: TextStyle(color: t.textMuted, fontSize: 12)),
           ],
         ),
       ),
@@ -513,5 +596,15 @@ class _FilesTabState extends State<FilesTab> {
 class _DownloadState {
   final String filename;
   final Map<int, String> chunks = {};
+  int totalChunks = 0;
   _DownloadState(this.filename);
+
+  double get progress => totalChunks > 0 ? chunks.length / totalChunks : 0.0;
+}
+
+class _UploadProgress {
+  final String filename;
+  final int totalChunks;
+  int sentChunks = 0;
+  _UploadProgress(this.filename, this.totalChunks);
 }

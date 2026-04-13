@@ -20,6 +20,13 @@ class _HomeScreenState extends State<HomeScreen> {
   int _currentTab = 0;
   bool _agentOnline = false;
   bool _wsConnected = false;
+  late WsService _ws;
+
+  // Store handler references for proper cleanup
+  late final void Function(Map<String, dynamic>) _onConnected;
+  late final void Function(Map<String, dynamic>) _onDisconnected;
+  late final void Function(Map<String, dynamic>) _onAgentStatus;
+  late final void Function(Map<String, dynamic>) _onError;
 
   final _tabLabels = const ['Terminal', 'Files', 'System', 'Screen'];
   final _tabIcons = const [
@@ -32,43 +39,37 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    _onConnected = (_) {
+      if (mounted) setState(() => _wsConnected = true);
+    };
+    _onDisconnected = (_) {
+      if (mounted) setState(() { _wsConnected = false; _agentOnline = false; });
+    };
+    _onAgentStatus = (msg) {
+      if (mounted) setState(() => _agentOnline = msg['payload']?['online'] == true);
+    };
+    _onError = (msg) {
+      if (mounted) {
+        final t = context.read<ThemeService>().current;
+        final message = msg['payload']?['message'] ?? 'Error';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message.toString()), backgroundColor: t.danger),
+        );
+      }
+    };
     WidgetsBinding.instance.addPostFrameCallback((_) => _connectWs());
   }
 
   void _connectWs() {
     final auth = context.read<AuthService>();
-    final ws = context.read<WsService>();
+    _ws = context.read<WsService>();
 
-    ws.on('_connected', (_) {
-      if (mounted) setState(() => _wsConnected = true);
-    });
-    ws.on('_disconnected', (_) {
-      if (mounted) {
-        setState(() {
-          _wsConnected = false;
-          _agentOnline = false;
-        });
-      }
-    });
-    ws.on('agent_status', (msg) {
-      if (mounted) {
-        setState(() => _agentOnline = msg['payload']?['online'] == true);
-      }
-    });
-    ws.on('error', (msg) {
-      if (mounted) {
-        final t = context.read<ThemeService>().current;
-        final message = msg['payload']?['message'] ?? 'Error';
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(message.toString()),
-            backgroundColor: t.danger,
-          ),
-        );
-      }
-    });
+    _ws.on('_connected', _onConnected);
+    _ws.on('_disconnected', _onDisconnected);
+    _ws.on('agent_status', _onAgentStatus);
+    _ws.on('error', _onError);
 
-    ws.connect(auth.wsUrl);
+    _ws.connect(auth.wsUrl);
   }
 
   void _logout() {
@@ -141,14 +142,25 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-      body: IndexedStack(
-        index: _currentTab,
-        children: const [
-          TerminalTab(),
-          FilesTab(),
-          DashboardTab(),
-          ScreenTab(),
-        ],
+      body: GestureDetector(
+        // Disable swipe on Screen tab (index 3) to avoid conflict with InteractiveViewer
+        onHorizontalDragEnd: _currentTab == 3 ? null : (details) {
+          if (details.primaryVelocity == null) return;
+          if (details.primaryVelocity! < -300) {
+            if (_currentTab < 3) setState(() => _currentTab++);
+          } else if (details.primaryVelocity! > 300) {
+            if (_currentTab > 0) setState(() => _currentTab--);
+          }
+        },
+        child: IndexedStack(
+          index: _currentTab,
+          children: const [
+            TerminalTab(),
+            FilesTab(),
+            DashboardTab(),
+            ScreenTab(),
+          ],
+        ),
       ),
       bottomNavigationBar: Container(
         decoration: BoxDecoration(
@@ -202,11 +214,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    final ws = context.read<WsService>();
-    ws.off('_connected');
-    ws.off('_disconnected');
-    ws.off('agent_status');
-    ws.off('error');
+    _ws.off('_connected', _onConnected);
+    _ws.off('_disconnected', _onDisconnected);
+    _ws.off('agent_status', _onAgentStatus);
+    _ws.off('error', _onError);
     super.dispose();
   }
 }

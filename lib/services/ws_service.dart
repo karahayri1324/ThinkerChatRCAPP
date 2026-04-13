@@ -5,6 +5,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 class WsService extends ChangeNotifier {
   WebSocketChannel? _channel;
+  StreamSubscription? _subscription;
   final Map<String, List<void Function(Map<String, dynamic>)>> _handlers = {};
 
   bool _connected = false;
@@ -24,9 +25,12 @@ class WsService extends ChangeNotifier {
 
   void _doConnect() {
     if (_url == null) return;
+    // Clean up old subscription before creating new one
+    _subscription?.cancel();
+    _subscription = null;
     try {
       _channel = WebSocketChannel.connect(Uri.parse(_url!));
-      _channel!.stream.listen(
+      _subscription = _channel!.stream.listen(
         (data) {
           if (!_connected) {
             _connected = true;
@@ -70,9 +74,15 @@ class WsService extends ChangeNotifier {
   }
 
   void send(String type, [Map<String, dynamic> payload = const {}]) {
-    final msg = jsonEncode({'type': type, 'payload': payload});
-    if (_channel != null && _connected) {
+    if (_channel == null || !_connected) return;
+    try {
+      final msg = jsonEncode({'type': type, 'payload': payload});
       _channel!.sink.add(msg);
+    } catch (e) {
+      debugPrint('WS send error: $e');
+      _connected = false;
+      notifyListeners();
+      _scheduleReconnect();
     }
   }
 
@@ -103,6 +113,8 @@ class WsService extends ChangeNotifier {
   void disconnect() {
     _shouldReconnect = false;
     _reconnectTimer?.cancel();
+    _subscription?.cancel();
+    _subscription = null;
     _channel?.sink.close();
     _channel = null;
     _connected = false;

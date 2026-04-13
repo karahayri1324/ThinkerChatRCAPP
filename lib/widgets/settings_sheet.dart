@@ -60,6 +60,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
     try {
       final auth = context.read<AuthService>();
       final result = await auth.changePassword(_oldPwCtrl.text, _newPwCtrl.text);
+      if (!mounted) return;
       setState(() {
         if (result['success'] == true) {
           _pwMsg = 'Password changed successfully'; _pwMsgColor = t.success;
@@ -69,7 +70,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
         }
       });
     } catch (e) {
-      setState(() { _pwMsg = 'Connection error'; _pwMsgColor = t.danger; });
+      if (mounted) setState(() { _pwMsg = 'Connection error'; _pwMsgColor = t.danger; });
     }
   }
 
@@ -77,6 +78,7 @@ class _SettingsSheetState extends State<SettingsSheet> {
     try {
       final auth = context.read<AuthService>();
       final data = await auth.setup2FA();
+      if (!mounted) return;
       if (data['secret'] != null) {
         setState(() {
           _showSetup = true; _tfaSecret = data['secret'] as String?;
@@ -91,13 +93,14 @@ class _SettingsSheetState extends State<SettingsSheet> {
     try {
       final auth = context.read<AuthService>();
       final result = await auth.enable2FA(_tfaCodeCtrl.text.trim());
+      if (!mounted) return;
       if (result['success'] == true) {
         setState(() { _showSetup = false; _tfaMsg = null; });
         _loadTFAStatus();
       } else {
         setState(() { _tfaMsg = result['error'] as String? ?? 'Failed'; _tfaCodeCtrl.clear(); });
       }
-    } catch (_) { setState(() => _tfaMsg = 'Connection error'); }
+    } catch (_) { if (mounted) setState(() => _tfaMsg = 'Connection error'); }
   }
 
   Future<void> _disableTFA() async {
@@ -105,11 +108,12 @@ class _SettingsSheetState extends State<SettingsSheet> {
     try {
       final auth = context.read<AuthService>();
       final result = await auth.disable2FA(_disablePwCtrl.text);
+      if (!mounted) return;
       if (result['success'] == true) {
         setState(() { _showDisable = false; _tfaMsg = null; });
         _loadTFAStatus();
       } else { setState(() => _tfaMsg = result['error'] as String? ?? 'Failed'); }
-    } catch (_) { setState(() => _tfaMsg = 'Connection error'); }
+    } catch (_) { if (mounted) setState(() => _tfaMsg = 'Connection error'); }
   }
 
   Future<void> _clearHistory() async {
@@ -225,9 +229,25 @@ class _SettingsSheetState extends State<SettingsSheet> {
               Divider(color: t.border),
               const SizedBox(height: 16),
 
-              // Terminal History
-              _sectionTitle(t, 'Terminal History'),
+              // Terminal Settings
+              _sectionTitle(t, 'Terminal'),
               const SizedBox(height: 10),
+              Row(
+                children: [
+                  Text('Font Size: ${context.watch<ThemeService>().terminalFontSize.toInt()}',
+                    style: TextStyle(color: t.textMuted, fontSize: 13)),
+                  Expanded(
+                    child: Slider(
+                      value: context.watch<ThemeService>().terminalFontSize,
+                      min: 8, max: 24,
+                      divisions: 16,
+                      activeColor: t.accent,
+                      onChanged: (v) => context.read<ThemeService>().setTerminalFontSize(v),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
               Text('Terminal output is saved locally for session restoration.',
                 style: TextStyle(color: t.textMuted, fontSize: 12)),
               const SizedBox(height: 12),

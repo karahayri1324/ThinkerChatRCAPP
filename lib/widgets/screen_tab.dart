@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../services/ws_service.dart';
 import '../services/theme_service.dart';
+import 'connection_banner.dart';
 
 class ScreenTab extends StatefulWidget {
   const ScreenTab({super.key});
@@ -44,6 +45,7 @@ class _ScreenTabState extends State<ScreenTab> {
     _ws = context.read<WsService>();
 
     _frameHandler = (msg) {
+      if (!mounted) return;
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       _naturalWidth = (payload['width'] as num?)?.toInt() ?? 0;
       _naturalHeight = (payload['height'] as num?)?.toInt() ?? 0;
@@ -53,6 +55,7 @@ class _ScreenTabState extends State<ScreenTab> {
     };
 
     _checkHandler = (msg) {
+      if (!mounted) return;
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       setState(() {
         _available = payload['available'] == true;
@@ -61,14 +64,13 @@ class _ScreenTabState extends State<ScreenTab> {
     };
 
     _errorHandler = (msg) {
+      if (!mounted) return;
       setState(() => _streaming = false);
-      if (mounted) {
-        final t = context.read<ThemeService>().current;
-        final message = (msg['payload'] as Map<String, dynamic>?)?['message'] ?? 'Screen error';
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(message.toString()), backgroundColor: t.danger),
-        );
-      }
+      final t = context.read<ThemeService>().current;
+      final message = (msg['payload'] as Map<String, dynamic>?)?['message'] ?? 'Screen error';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message.toString()), backgroundColor: t.danger),
+      );
     };
 
     _connHandler = (_) {
@@ -130,17 +132,21 @@ class _ScreenTabState extends State<ScreenTab> {
     if (_naturalWidth == 0 || _naturalHeight == 0) return Offset.zero;
     final box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null) return Offset.zero;
-    final matrix = _transformCtrl.value;
-    final inverted = Matrix4.inverted(matrix);
-    final transformed = MatrixUtils.transformPoint(inverted, local);
-
     final canvasSize = box.size;
-    final scaleX = _naturalWidth / canvasSize.width;
-    final scaleY = _naturalHeight / canvasSize.height;
-    return Offset(
-      (transformed.dx * scaleX).clamp(0, _naturalWidth.toDouble()).roundToDouble(),
-      (transformed.dy * scaleY).clamp(0, _naturalHeight.toDouble()).roundToDouble(),
-    );
+    if (canvasSize.width == 0 || canvasSize.height == 0) return Offset.zero;
+    final matrix = _transformCtrl.value;
+    try {
+      final inverted = Matrix4.inverted(matrix);
+      final transformed = MatrixUtils.transformPoint(inverted, local);
+      final scaleX = _naturalWidth / canvasSize.width;
+      final scaleY = _naturalHeight / canvasSize.height;
+      return Offset(
+        (transformed.dx * scaleX).clamp(0, _naturalWidth.toDouble()).roundToDouble(),
+        (transformed.dy * scaleY).clamp(0, _naturalHeight.toDouble()).roundToDouble(),
+      );
+    } catch (_) {
+      return Offset.zero;
+    }
   }
 
   void _onTapDown(TapDownDetails d) {
@@ -161,12 +167,12 @@ class _ScreenTabState extends State<ScreenTab> {
     });
   }
 
-  void _onDoubleTap() {
+  void _onDoubleTapDown(TapDownDetails d) {
     if (!_streaming) return;
-    // Double-click at center of last known position
+    final remote = _toRemote(d.localPosition);
     _ws.send('screen_input', {
       'input_type': 'mouse_dblclick',
-      'data': {'x': _naturalWidth ~/ 2, 'y': _naturalHeight ~/ 2, 'button': 1},
+      'data': {'x': remote.dx.toInt(), 'y': remote.dy.toInt(), 'button': 1},
     });
   }
 
@@ -219,6 +225,7 @@ class _ScreenTabState extends State<ScreenTab> {
 
     return Column(
       children: [
+        const ConnectionBanner(),
         // Controls (collapsible)
         if (_showControls) _buildControls(t, wsConnected),
         Divider(height: 1, color: t.border),
@@ -232,30 +239,51 @@ class _ScreenTabState extends State<ScreenTab> {
                       ? _buildStatus(t, Icons.desktop_access_disabled, 'Screen sharing not available on this agent')
                       : _currentFrame == null
                           ? _buildStatus(t, _streaming ? Icons.hourglass_empty : Icons.desktop_windows, _streaming ? 'Waiting for frames...' : 'Tap Start to begin')
-                          : GestureDetector(
-                              onTap: () => setState(() => _showControls = !_showControls),
-                              child: Container(
-                                color: Colors.black,
-                                child: InteractiveViewer(
-                                  transformationController: _transformCtrl,
-                                  minScale: 1.0,
-                                  maxScale: 5.0,
-                                  panEnabled: true,
-                                  scaleEnabled: true,
-                                  child: Center(
-                                    child: GestureDetector(
-                                      onTapDown: _onTapDown,
-                                      onTapUp: _onTapUp,
-                                      onDoubleTap: _onDoubleTap,
-                                      child: CustomPaint(
-                                        key: _canvasKey,
-                                        painter: _FramePainter(_currentFrame!),
-                                        size: _calculateSize(context),
+                          : Stack(
+                              children: [
+                                Container(
+                                  color: Colors.black,
+                                  child: InteractiveViewer(
+                                    transformationController: _transformCtrl,
+                                    minScale: 1.0,
+                                    maxScale: 5.0,
+                                    panEnabled: true,
+                                    scaleEnabled: true,
+                                    child: Center(
+                                      child: GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        onTapDown: _onTapDown,
+                                        onTapUp: _onTapUp,
+                                        onDoubleTapDown: _onDoubleTapDown,
+                                        child: CustomPaint(
+                                          key: _canvasKey,
+                                          painter: _FramePainter(_currentFrame!),
+                                          size: _calculateSize(context),
+                                        ),
                                       ),
                                     ),
                                   ),
                                 ),
-                              ),
+                                // Toggle controls button
+                                Positioned(
+                                  top: 8, right: 8,
+                                  child: Material(
+                                    color: Colors.black54,
+                                    borderRadius: BorderRadius.circular(20),
+                                    child: InkWell(
+                                      borderRadius: BorderRadius.circular(20),
+                                      onTap: () => setState(() => _showControls = !_showControls),
+                                      child: Padding(
+                                        padding: const EdgeInsets.all(8),
+                                        child: Icon(
+                                          _showControls ? Icons.expand_less : Icons.expand_more,
+                                          color: Colors.white70, size: 20,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
         ),
         // Remote keyboard toolbar (when streaming)
@@ -409,6 +437,9 @@ class _ScreenTabState extends State<ScreenTab> {
                   _remoteKeyBtn(t, 'PgDn', 'Next'),
                   _remoteKeyBtn(t, 'F5', 'F5'),
                   _remoteKeyBtn(t, 'F11', 'F11'),
+                  // Scroll buttons
+                  _remoteScrollBtn(t, Icons.expand_less, 'up'),
+                  _remoteScrollBtn(t, Icons.expand_more, 'down'),
                 ],
               ),
             ),
@@ -451,6 +482,37 @@ class _ScreenTabState extends State<ScreenTab> {
             constraints: const BoxConstraints(minWidth: 36, minHeight: 32),
             alignment: Alignment.center,
             child: Icon(icon, size: 16, color: t.textPrimary),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _remoteScrollBtn(AppThemeData t, IconData icon, String direction) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: Material(
+        color: t.accent.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: () {
+            if (!_streaming) return;
+            HapticFeedback.lightImpact();
+            _ws.send('screen_input', {
+              'input_type': 'mouse_scroll',
+              'data': {
+                'x': _naturalWidth ~/ 2,
+                'y': _naturalHeight ~/ 2,
+                'direction': direction,
+                'clicks': 3,
+              },
+            });
+          },
+          child: Container(
+            constraints: const BoxConstraints(minWidth: 36, minHeight: 32),
+            alignment: Alignment.center,
+            child: Icon(icon, size: 16, color: t.accent),
           ),
         ),
       ),

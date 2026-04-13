@@ -6,6 +6,7 @@ import 'package:xterm/xterm.dart';
 import '../services/ws_service.dart';
 import '../services/theme_service.dart';
 import '../services/terminal_history_service.dart';
+import 'connection_banner.dart';
 
 class _ShellEntry {
   final String id;
@@ -31,7 +32,7 @@ class _TerminalTabState extends State<TerminalTab> {
   // Command input
   final TextEditingController _inputCtrl = TextEditingController();
   final FocusNode _inputFocusNode = FocusNode();
-  bool _useInputBar = true; // true = line-mode input bar, false = raw xterm keyboard
+  bool _useInputBar = true;
 
   // History save debounce
   Timer? _saveTimer;
@@ -42,6 +43,7 @@ class _TerminalTabState extends State<TerminalTab> {
     super.initState();
     _ws = context.read<WsService>();
     _outputHandler = (msg) {
+      if (!mounted) return;
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       final shellId = payload['shell_id']?.toString() ?? '1';
       final data = payload['data'] as String? ?? '';
@@ -124,15 +126,36 @@ class _TerminalTabState extends State<TerminalTab> {
     if (_shells.isEmpty) return;
     final text = _inputCtrl.text;
     if (text.isEmpty) {
-      // Empty enter = just send \r
       _sendKey('\r');
       return;
     }
     HapticFeedback.lightImpact();
     final shellId = _shells[_activeIndex].id;
-    // Send each character + carriage return
     _ws.send('shell_input', {'shell_id': shellId, 'data': '$text\r'});
     _inputCtrl.clear();
+  }
+
+  Future<void> _pasteClipboard() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    if (data?.text != null && data!.text!.isNotEmpty) {
+      if (_useInputBar) {
+        // Paste into input field
+        final currentText = _inputCtrl.text;
+        final selection = _inputCtrl.selection;
+        final newText = currentText.replaceRange(
+          selection.start.clamp(0, currentText.length),
+          selection.end.clamp(0, currentText.length),
+          data.text!,
+        );
+        _inputCtrl.text = newText;
+        _inputCtrl.selection = TextSelection.collapsed(
+          offset: (selection.start.clamp(0, currentText.length) + data.text!.length),
+        );
+      } else {
+        // Send directly to terminal
+        _sendKey(data.text!);
+      }
+    }
   }
 
   void _dismissKeyboard() {
@@ -149,7 +172,11 @@ class _TerminalTabState extends State<TerminalTab> {
   @override
   void dispose() {
     _saveTimer?.cancel();
-    _flushSaves(); // save any pending data
+    final saves = Map<String, String>.of(_pendingSaves);
+    _pendingSaves.clear();
+    for (final entry in saves.entries) {
+      TerminalHistoryService.saveOutput(entry.key, entry.value);
+    }
     _ws.off('shell_output', _outputHandler);
     _inputCtrl.dispose();
     _inputFocusNode.dispose();
@@ -162,9 +189,12 @@ class _TerminalTabState extends State<TerminalTab> {
   @override
   Widget build(BuildContext context) {
     final t = context.watch<ThemeService>().current;
+    final fontSize = context.watch<ThemeService>().terminalFontSize;
+    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
 
     return Column(
       children: [
+        const ConnectionBanner(),
         // Tab bar
         _buildTabBar(t),
         Divider(height: 1, color: t.border),
@@ -187,12 +217,12 @@ class _TerminalTabState extends State<TerminalTab> {
                     }
                   },
                   child: AbsorbPointer(
-                    absorbing: _useInputBar, // block xterm keyboard in input-bar mode
+                    absorbing: _useInputBar,
                     child: TerminalView(
                       _shells[_activeIndex].terminal,
                       focusNode: _shells[_activeIndex].focusNode,
-                      textStyle: const TerminalStyle(
-                        fontSize: 13,
+                      textStyle: TerminalStyle(
+                        fontSize: fontSize,
                         fontFamily: 'monospace',
                       ),
                       theme: t.toTerminalTheme(),
@@ -206,7 +236,7 @@ class _TerminalTabState extends State<TerminalTab> {
         // Command input bar (line mode)
         if (_useInputBar) _buildInputBar(t),
         // Special keys toolbar
-        _buildKeyToolbar(t),
+        _buildKeyToolbar(t, isLandscape),
       ],
     );
   }
@@ -258,22 +288,45 @@ class _TerminalTabState extends State<TerminalTab> {
               },
             ),
           ),
+          // Font size controls
+          InkWell(
+            onTap: () => context.read<ThemeService>().setTerminalFontSize(
+              context.read<ThemeService>().terminalFontSize - 1,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Icon(Icons.text_decrease, size: 16, color: t.textMuted),
+            ),
+          ),
+          InkWell(
+            onTap: () => context.read<ThemeService>().setTerminalFontSize(
+              context.read<ThemeService>().terminalFontSize + 1,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Icon(Icons.text_increase, size: 16, color: t.textMuted),
+            ),
+          ),
+          const SizedBox(width: 4),
           // Input mode toggle
           InkWell(
             onTap: () => setState(() => _useInputBar = !_useInputBar),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Icon(
-                _useInputBar ? Icons.keyboard : Icons.text_fields,
-                size: 18,
-                color: t.accent,
+            child: Tooltip(
+              message: _useInputBar ? 'Switch to raw keyboard' : 'Switch to input bar',
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                child: Icon(
+                  _useInputBar ? Icons.keyboard : Icons.text_fields,
+                  size: 18,
+                  color: t.accent,
+                ),
               ),
             ),
           ),
           InkWell(
             onTap: _createShell,
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 10),
               child: Icon(Icons.add, size: 18, color: t.textMuted),
             ),
           ),
@@ -297,7 +350,7 @@ class _TerminalTabState extends State<TerminalTab> {
               style: TextStyle(color: t.textPrimary, fontSize: 14, fontFamily: 'monospace'),
               decoration: InputDecoration(
                 hintText: 'Type command...',
-                hintStyle: TextStyle(color: t.textMuted.withOpacity( 0.5)),
+                hintStyle: TextStyle(color: t.textMuted.withOpacity(0.5)),
                 border: InputBorder.none,
                 isDense: true,
                 contentPadding: const EdgeInsets.symmetric(vertical: 8),
@@ -305,7 +358,7 @@ class _TerminalTabState extends State<TerminalTab> {
               textInputAction: TextInputAction.send,
               onSubmitted: (_) {
                 _sendCommand();
-                _inputFocusNode.requestFocus(); // keep focus
+                _inputFocusNode.requestFocus();
               },
             ),
           ),
@@ -327,42 +380,47 @@ class _TerminalTabState extends State<TerminalTab> {
     );
   }
 
-  Widget _buildKeyToolbar(AppThemeData t) {
+  Widget _buildKeyToolbar(AppThemeData t, bool isLandscape) {
+    // In landscape, use a more compact layout
+    final buttonHeight = isLandscape ? 30.0 : 36.0;
+    final fontSize = isLandscape ? 10.0 : 12.0;
+    final iconSize = isLandscape ? 14.0 : 16.0;
+    final vPad = isLandscape ? 3.0 : 6.0;
+
     return Container(
       color: t.bgSecondary,
       child: SafeArea(
         top: false,
         child: SingleChildScrollView(
           scrollDirection: Axis.horizontal,
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+          padding: EdgeInsets.symmetric(horizontal: 4, vertical: vPad),
           child: Row(
             children: [
-              // Dismiss keyboard
-              _iconBtn(t, Icons.keyboard_hide, _dismissKeyboard, highlight: true),
-              // Enter key (critical for iOS)
-              _kbButton(t, 'ENTER', '\r', highlight: true),
-              _arrowButton(t, Icons.backspace_outlined, '\x7f'),
-              _kbButton(t, 'TAB', '\t'),
-              _kbButton(t, 'ESC', '\x1b'),
-              _kbButton(t, '^C', '\x03'),
-              _kbButton(t, '^D', '\x04'),
-              _kbButton(t, '^Z', '\x1a'),
-              _kbButton(t, '^L', '\x0c'),
-              _arrowButton(t, Icons.arrow_upward, '\x1b[A'),
-              _arrowButton(t, Icons.arrow_downward, '\x1b[B'),
-              _arrowButton(t, Icons.arrow_back, '\x1b[D'),
-              _arrowButton(t, Icons.arrow_forward, '\x1b[C'),
-              _kbButton(t, 'HOME', '\x1b[H'),
-              _kbButton(t, 'END', '\x1b[F'),
-              _kbButton(t, 'PGUP', '\x1b[5~'),
-              _kbButton(t, 'PGDN', '\x1b[6~'),
-              _kbButton(t, 'DEL', '\x1b[3~'),
-              _kbButton(t, '|', '|'),
-              _kbButton(t, '/', '/'),
-              _kbButton(t, '-', '-'),
-              _kbButton(t, '~', '~'),
-              _kbButton(t, '_', '_'),
-              _kbButton(t, '\\', '\\'),
+              _iconBtn(t, Icons.keyboard_hide, _dismissKeyboard, highlight: true, h: buttonHeight, iconSz: iconSize),
+              _iconBtn(t, Icons.content_paste, _pasteClipboard, highlight: true, h: buttonHeight, iconSz: iconSize),
+              _kbButton(t, 'ENTER', '\r', highlight: true, h: buttonHeight, fs: fontSize),
+              _arrowButton(t, Icons.backspace_outlined, '\x7f', h: buttonHeight, iconSz: iconSize),
+              _kbButton(t, 'TAB', '\t', h: buttonHeight, fs: fontSize),
+              _kbButton(t, 'ESC', '\x1b', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '^C', '\x03', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '^D', '\x04', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '^Z', '\x1a', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '^L', '\x0c', h: buttonHeight, fs: fontSize),
+              _arrowButton(t, Icons.arrow_upward, '\x1b[A', h: buttonHeight, iconSz: iconSize),
+              _arrowButton(t, Icons.arrow_downward, '\x1b[B', h: buttonHeight, iconSz: iconSize),
+              _arrowButton(t, Icons.arrow_back, '\x1b[D', h: buttonHeight, iconSz: iconSize),
+              _arrowButton(t, Icons.arrow_forward, '\x1b[C', h: buttonHeight, iconSz: iconSize),
+              _kbButton(t, 'HOME', '\x1b[H', h: buttonHeight, fs: fontSize),
+              _kbButton(t, 'END', '\x1b[F', h: buttonHeight, fs: fontSize),
+              _kbButton(t, 'PGUP', '\x1b[5~', h: buttonHeight, fs: fontSize),
+              _kbButton(t, 'PGDN', '\x1b[6~', h: buttonHeight, fs: fontSize),
+              _kbButton(t, 'DEL', '\x1b[3~', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '|', '|', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '/', '/', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '-', '-', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '~', '~', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '_', '_', h: buttonHeight, fs: fontSize),
+              _kbButton(t, '\\', '\\', h: buttonHeight, fs: fontSize),
             ],
           ),
         ),
@@ -370,24 +428,24 @@ class _TerminalTabState extends State<TerminalTab> {
     );
   }
 
-  Widget _kbButton(AppThemeData t, String label, String data, {bool highlight = false}) {
+  Widget _kbButton(AppThemeData t, String label, String data, {bool highlight = false, double h = 36, double fs = 12}) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 2),
       child: Material(
-        color: highlight ? t.accent.withOpacity( 0.2) : t.bgTertiary,
+        color: highlight ? t.accent.withOpacity(0.2) : t.bgTertiary,
         borderRadius: BorderRadius.circular(6),
         child: InkWell(
           borderRadius: BorderRadius.circular(6),
           onTap: () => _sendKey(data),
           child: Container(
-            constraints: const BoxConstraints(minWidth: 40, minHeight: 36),
+            constraints: BoxConstraints(minWidth: 40, minHeight: h),
             padding: const EdgeInsets.symmetric(horizontal: 10),
             alignment: Alignment.center,
             child: Text(
               label,
               style: TextStyle(
                 color: highlight ? t.accent : t.textPrimary,
-                fontSize: 12,
+                fontSize: fs,
                 fontFamily: 'monospace',
                 fontWeight: highlight ? FontWeight.bold : FontWeight.normal,
               ),
@@ -398,7 +456,7 @@ class _TerminalTabState extends State<TerminalTab> {
     );
   }
 
-  Widget _arrowButton(AppThemeData t, IconData icon, String data) {
+  Widget _arrowButton(AppThemeData t, IconData icon, String data, {double h = 36, double iconSz = 16}) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 2),
       child: Material(
@@ -408,28 +466,28 @@ class _TerminalTabState extends State<TerminalTab> {
           borderRadius: BorderRadius.circular(6),
           onTap: () => _sendKey(data),
           child: Container(
-            constraints: const BoxConstraints(minWidth: 40, minHeight: 36),
+            constraints: BoxConstraints(minWidth: 40, minHeight: h),
             alignment: Alignment.center,
-            child: Icon(icon, size: 16, color: t.textPrimary),
+            child: Icon(icon, size: iconSz, color: t.textPrimary),
           ),
         ),
       ),
     );
   }
 
-  Widget _iconBtn(AppThemeData t, IconData icon, VoidCallback onTap, {bool highlight = false}) {
+  Widget _iconBtn(AppThemeData t, IconData icon, VoidCallback onTap, {bool highlight = false, double h = 36, double iconSz = 18}) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 2),
       child: Material(
-        color: highlight ? t.accent.withOpacity( 0.2) : t.bgTertiary,
+        color: highlight ? t.accent.withOpacity(0.2) : t.bgTertiary,
         borderRadius: BorderRadius.circular(6),
         child: InkWell(
           borderRadius: BorderRadius.circular(6),
           onTap: onTap,
           child: Container(
-            constraints: const BoxConstraints(minWidth: 40, minHeight: 36),
+            constraints: BoxConstraints(minWidth: 40, minHeight: h),
             alignment: Alignment.center,
-            child: Icon(icon, size: 18, color: highlight ? t.accent : t.textPrimary),
+            child: Icon(icon, size: iconSz, color: highlight ? t.accent : t.textPrimary),
           ),
         ),
       ),

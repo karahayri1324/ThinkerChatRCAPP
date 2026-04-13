@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/ws_service.dart';
 import '../services/theme_service.dart';
+import 'connection_banner.dart';
 
 class DashboardTab extends StatefulWidget {
   const DashboardTab({super.key});
@@ -21,6 +22,8 @@ class _DashboardTabState extends State<DashboardTab>
   DateTime? _prevNetTime;
 
   late void Function(Map<String, dynamic>) _handler;
+  String _upSpeed = '';
+  String _downSpeed = '';
 
   @override
   bool get wantKeepAlive => true;
@@ -30,10 +33,31 @@ class _DashboardTabState extends State<DashboardTab>
     super.initState();
     _ws = context.read<WsService>();
     _handler = (msg) {
-      if (mounted) setState(() => _data = msg['payload'] as Map<String, dynamic>?);
+      if (!mounted) return;
+      final data = msg['payload'] as Map<String, dynamic>?;
+      _updateNetworkSpeed(data);
+      setState(() => _data = data);
     };
     _ws.on('sysinfo_res', _handler);
     _startPolling();
+  }
+
+  void _updateNetworkSpeed(Map<String, dynamic>? data) {
+    if (data == null) return;
+    final net = data['net'] as Map<String, dynamic>? ?? {};
+    final now = DateTime.now();
+    if (_prevBytesSent != null && _prevBytesRecv != null && _prevNetTime != null) {
+      final dt = now.difference(_prevNetTime!).inMilliseconds / 1000;
+      if (dt > 0) {
+        final up = ((net['bytes_sent'] as num? ?? 0).toInt() - _prevBytesSent!) / dt;
+        final down = ((net['bytes_recv'] as num? ?? 0).toInt() - _prevBytesRecv!) / dt;
+        _upSpeed = '${_formatBytes(up.toInt())}/s';
+        _downSpeed = '${_formatBytes(down.toInt())}/s';
+      }
+    }
+    _prevBytesSent = (net['bytes_sent'] as num?)?.toInt();
+    _prevBytesRecv = (net['bytes_recv'] as num?)?.toInt();
+    _prevNetTime = now;
   }
 
   void _startPolling() {
@@ -55,9 +79,18 @@ class _DashboardTabState extends State<DashboardTab>
     super.build(context);
     final t = context.watch<ThemeService>().current;
     if (_data == null) {
-      return Center(child: CircularProgressIndicator(color: t.accent));
+      return const Column(
+        children: [
+          ConnectionBanner(),
+          Expanded(child: Center(child: CircularProgressIndicator())),
+        ],
+      );
     }
-    return ListView(
+    return Column(
+      children: [
+        const ConnectionBanner(),
+        Expanded(
+          child: ListView(
       padding: const EdgeInsets.all(12),
       children: [
         _buildSystemCard(t),
@@ -73,6 +106,8 @@ class _DashboardTabState extends State<DashboardTab>
           const SizedBox(height: 10),
           ..._buildGpuCards(t),
         ],
+      ],
+    )),
       ],
     );
   }
@@ -190,24 +225,11 @@ class _DashboardTabState extends State<DashboardTab>
 
   Widget _buildNetworkCard(AppThemeData t) {
     final net = _data!['net'] as Map<String, dynamic>? ?? {};
-    final now = DateTime.now();
-    String upSpeed = '', downSpeed = '';
-    if (_prevBytesSent != null && _prevNetTime != null) {
-      final dt = now.difference(_prevNetTime!).inMilliseconds / 1000;
-      if (dt > 0) {
-        final up = ((net['bytes_sent'] as num? ?? 0).toInt() - _prevBytesSent!) / dt;
-        final down = ((net['bytes_recv'] as num? ?? 0).toInt() - _prevBytesRecv!) / dt;
-        upSpeed = '${_formatBytes(up.toInt())}/s'; downSpeed = '${_formatBytes(down.toInt())}/s';
-      }
-    }
-    _prevBytesSent = (net['bytes_sent'] as num?)?.toInt();
-    _prevBytesRecv = (net['bytes_recv'] as num?)?.toInt();
-    _prevNetTime = now;
     return _card(t, 'Network', Column(children: [
       _infoRow(t, 'Total Sent', _formatBytes(net['bytes_sent'])),
       _infoRow(t, 'Total Received', _formatBytes(net['bytes_recv'])),
-      if (upSpeed.isNotEmpty) _infoRow(t, 'Upload', upSpeed),
-      if (downSpeed.isNotEmpty) _infoRow(t, 'Download', downSpeed),
+      if (_upSpeed.isNotEmpty) _infoRow(t, 'Upload', _upSpeed),
+      if (_downSpeed.isNotEmpty) _infoRow(t, 'Download', _downSpeed),
     ]));
   }
 
