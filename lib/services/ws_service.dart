@@ -12,7 +12,12 @@ class WsService extends ChangeNotifier {
   bool _shouldReconnect = true;
   int _reconnectDelay = 1000;
   static const _maxReconnectDelay = 30000;
+  static const _heartbeatInterval = Duration(seconds: 20);
+  static const _staleThreshold = Duration(seconds: 50);
   Timer? _reconnectTimer;
+  Timer? _heartbeatTimer;
+  Timer? _watchdogTimer;
+  DateTime? _lastMessageAt;
   String? _url;
 
   bool get connected => _connected;
@@ -25,16 +30,23 @@ class WsService extends ChangeNotifier {
 
   void _doConnect() {
     if (_url == null) return;
-    // Clean up old subscription before creating new one
+    // Clean up old subscription and channel before creating new one
     _subscription?.cancel();
     _subscription = null;
+    try {
+      _channel?.sink.close();
+    } catch (_) {}
+    _channel = null;
+    _stopHeartbeat();
     try {
       _channel = WebSocketChannel.connect(Uri.parse(_url!));
       _subscription = _channel!.stream.listen(
         (data) {
+          _lastMessageAt = DateTime.now();
           if (!_connected) {
             _connected = true;
             _reconnectDelay = 1000;
+            _startHeartbeat();
             _dispatch('_connected', {});
             notifyListeners();
           }
@@ -47,12 +59,14 @@ class WsService extends ChangeNotifier {
         },
         onDone: () {
           _connected = false;
+          _stopHeartbeat();
           _dispatch('_disconnected', {});
           notifyListeners();
           _scheduleReconnect();
         },
         onError: (e) {
           _connected = false;
+          _stopHeartbeat();
           _dispatch('_disconnected', {});
           notifyListeners();
           _scheduleReconnect();
@@ -62,6 +76,49 @@ class WsService extends ChangeNotifier {
       debugPrint('WS connect error: $e');
       _scheduleReconnect();
     }
+  }
+
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _watchdogTimer?.cancel();
+    _lastMessageAt = DateTime.now();
+    _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) {
+      if (_connected) send('heartbeat');
+    });
+    _watchdogTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      final last = _lastMessageAt;
+      if (last == null) return;
+      if (DateTime.now().difference(last) > _staleThreshold) {
+        debugPrint('WS watchdog: stale connection, forcing reconnect');
+        forceReconnect();
+      }
+    });
+  }
+
+  void _stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+  }
+
+  void forceReconnect() {
+    if (_url == null) return;
+    _stopHeartbeat();
+    _subscription?.cancel();
+    _subscription = null;
+    try {
+      _channel?.sink.close();
+    } catch (_) {}
+    _channel = null;
+    if (_connected) {
+      _connected = false;
+      _dispatch('_disconnected', {});
+      notifyListeners();
+    }
+    _reconnectDelay = 1000;
+    _reconnectTimer?.cancel();
+    _doConnect();
   }
 
   void _scheduleReconnect() {
@@ -113,6 +170,7 @@ class WsService extends ChangeNotifier {
   void disconnect() {
     _shouldReconnect = false;
     _reconnectTimer?.cancel();
+    _stopHeartbeat();
     _subscription?.cancel();
     _subscription = null;
     _channel?.sink.close();

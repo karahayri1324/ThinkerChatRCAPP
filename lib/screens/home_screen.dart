@@ -16,7 +16,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _currentTab = 0;
   bool _agentOnline = false;
   bool _wsConnected = false;
@@ -39,6 +39,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _onConnected = (_) {
       if (mounted) setState(() => _wsConnected = true);
     };
@@ -213,7 +214,17 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // Force reconnect on resume to recover from any stale WS
+      // left over from backgrounding or network changes.
+      _ws.forceReconnect();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _ws.off('_connected', _onConnected);
     _ws.off('_disconnected', _onDisconnected);
     _ws.off('agent_status', _onAgentStatus);
