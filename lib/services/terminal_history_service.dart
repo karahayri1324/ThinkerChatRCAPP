@@ -20,12 +20,15 @@ class TerminalHistoryService {
         : combined;
     history[shellId] = trimmed;
 
-    // Cap total shells stored
+    // Cap total shells stored. Shell IDs are numeric strings ('1','2',...,'11'),
+    // so sort numerically (not lexicographically, where '10' < '2') and evict
+    // the lowest (oldest) IDs, keeping the most recent _maxShells shells.
     if (history.length > _maxShells) {
-      final oldestKeys = history.keys.toList()
-        ..sort()
-        ..removeRange(_maxShells, history.length);
-      history.removeWhere((k, _) => !oldestKeys.contains(k));
+      final sortedKeys = history.keys.toList()..sort(_compareShellIds);
+      final removeCount = history.length - _maxShells;
+      for (final key in sortedKeys.take(removeCount)) {
+        history.remove(key);
+      }
     }
 
     await prefs.setString(_historyKey, jsonEncode(history));
@@ -38,11 +41,19 @@ class TerminalHistoryService {
     return history[shellId];
   }
 
-  /// Get all saved shell IDs
+  /// Get all saved shell IDs (numerically sorted)
   static Future<List<String>> getSavedShellIds() async {
     final prefs = await SharedPreferences.getInstance();
     final history = _loadMap(prefs);
-    return history.keys.toList()..sort();
+    return history.keys.toList()..sort(_compareShellIds);
+  }
+
+  /// Compare shell IDs numerically, falling back to string order for non-numeric IDs.
+  static int _compareShellIds(String a, String b) {
+    final ia = int.tryParse(a);
+    final ib = int.tryParse(b);
+    if (ia != null && ib != null) return ia.compareTo(ib);
+    return a.compareTo(b);
   }
 
   /// Clear history for a shell

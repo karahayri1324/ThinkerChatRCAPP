@@ -21,6 +21,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _agentOnline = false;
   bool _wsConnected = false;
   late WsService _ws;
+  // Drives per-tab visibility (so the dashboard can pause polling off-screen).
+  final ValueNotifier<int> _tabNotifier = ValueNotifier<int>(0);
 
   // Store handler references for proper cleanup
   late final void Function(Map<String, dynamic>) _onConnected;
@@ -39,6 +41,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    // Resolve the WsService synchronously so didChangeAppLifecycleState (which
+    // can fire before the post-frame callback) never touches an unset `late`.
+    _ws = context.read<WsService>();
     WidgetsBinding.instance.addObserver(this);
     _onConnected = (_) {
       if (mounted) setState(() => _wsConnected = true);
@@ -53,17 +58,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (mounted) {
         final t = context.read<ThemeService>().current;
         final message = msg['payload']?['message'] ?? 'Error';
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(message.toString()), backgroundColor: t.danger),
-        );
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text(message.toString()), backgroundColor: t.danger));
       }
     };
     WidgetsBinding.instance.addPostFrameCallback((_) => _connectWs());
   }
 
+  void _setTab(int i) {
+    setState(() => _currentTab = i);
+    _tabNotifier.value = i;
+  }
+
   void _connectWs() {
     final auth = context.read<AuthService>();
-    _ws = context.read<WsService>();
 
     _ws.on('_connected', _onConnected);
     _ws.on('_disconnected', _onDisconnected);
@@ -148,18 +157,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         onHorizontalDragEnd: _currentTab == 3 ? null : (details) {
           if (details.primaryVelocity == null) return;
           if (details.primaryVelocity! < -300) {
-            if (_currentTab < 3) setState(() => _currentTab++);
+            if (_currentTab < 3) _setTab(_currentTab + 1);
           } else if (details.primaryVelocity! > 300) {
-            if (_currentTab > 0) setState(() => _currentTab--);
+            if (_currentTab > 0) _setTab(_currentTab - 1);
           }
         },
         child: IndexedStack(
           index: _currentTab,
-          children: const [
-            TerminalTab(),
-            FilesTab(),
-            DashboardTab(),
-            ScreenTab(),
+          children: [
+            const TerminalTab(),
+            const FilesTab(),
+            DashboardTab(activeTab: _tabNotifier),
+            const ScreenTab(),
           ],
         ),
       ),
@@ -176,7 +185,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               children: List.generate(4, (i) {
                 final active = _currentTab == i;
                 return InkWell(
-                  onTap: () => setState(() => _currentTab = i),
+                  onTap: () => _setTab(i),
                   borderRadius: BorderRadius.circular(8),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
@@ -229,6 +238,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _ws.off('_disconnected', _onDisconnected);
     _ws.off('agent_status', _onAgentStatus);
     _ws.off('error', _onError);
+    _tabNotifier.dispose();
     super.dispose();
   }
 }

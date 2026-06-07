@@ -22,7 +22,7 @@ class TerminalTab extends StatefulWidget {
   State<TerminalTab> createState() => _TerminalTabState();
 }
 
-class _TerminalTabState extends State<TerminalTab> {
+class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
   final List<_ShellEntry> _shells = [];
   int _activeIndex = 0;
   int _nextId = 1;
@@ -37,10 +37,16 @@ class _TerminalTabState extends State<TerminalTab> {
   // History save debounce
   Timer? _saveTimer;
   final Map<String, String> _pendingSaves = {};
+  static const _saveDebounce = Duration(seconds: 3);
+  // Flush immediately once a shell's pending buffer crosses this size, so a
+  // continuously-streaming shell (e.g. `top`) can't grow unbounded in RAM and
+  // never persist (the debounce timer keeps resetting under steady output).
+  static const _maxPendingPerShell = 16 * 1024;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _ws = context.read<WsService>();
     _outputHandler = (msg) {
       if (!mounted) return;
@@ -58,16 +64,38 @@ class _TerminalTabState extends State<TerminalTab> {
   }
 
   void _debounceSave(String shellId, String data) {
-    _pendingSaves[shellId] = (_pendingSaves[shellId] ?? '') + data;
+    final pending = (_pendingSaves[shellId] ?? '') + data;
+    _pendingSaves[shellId] = pending;
+    // High-water mark: under sustained output the debounce timer would reset
+    // forever and never flush, so force a flush once a buffer gets large.
+    if (pending.length >= _maxPendingPerShell) {
+      _flushSaves();
+      return;
+    }
     _saveTimer?.cancel();
-    _saveTimer = Timer(const Duration(seconds: 3), _flushSaves);
+    _saveTimer = Timer(_saveDebounce, _flushSaves);
   }
 
   Future<void> _flushSaves() async {
+    _saveTimer?.cancel();
+    _saveTimer = null;
+    if (_pendingSaves.isEmpty) return;
     final saves = Map<String, String>.of(_pendingSaves);
     _pendingSaves.clear();
     for (final entry in saves.entries) {
       await TerminalHistoryService.saveOutput(entry.key, entry.value);
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Persist pending terminal output when the app is backgrounded/closing —
+    // this is the only point we can reliably await the save before the OS may
+    // kill the process (dispose() runs too late and can't await).
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden) {
+      _flushSaves();
     }
   }
 
@@ -88,13 +116,15 @@ class _TerminalTabState extends State<TerminalTab> {
       });
     };
 
+    // Create the shell server-side before any input/resize can be emitted, so
+    // shell_input/shell_resize never race ahead of shell_create.
+    _ws.send('shell_create', {'shell_id': shellId});
+
     final savedHistory = await TerminalHistoryService.getOutput(shellId);
     if (savedHistory != null && savedHistory.isNotEmpty) {
       terminal.write(savedHistory);
       terminal.write('\r\n--- Session restored ---\r\n');
     }
-
-    _ws.send('shell_create', {'shell_id': shellId});
 
     setState(() {
       _shells.add(_ShellEntry(shellId, terminal, focusNode));
@@ -171,7 +201,10 @@ class _TerminalTabState extends State<TerminalTab> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _saveTimer?.cancel();
+    // Best-effort final flush (can't be awaited in dispose; lifecycle paused
+    // handler above is the reliable persistence point).
     final saves = Map<String, String>.of(_pendingSaves);
     _pendingSaves.clear();
     for (final entry in saves.entries) {

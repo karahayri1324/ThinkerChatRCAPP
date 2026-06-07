@@ -29,12 +29,23 @@ class AuthService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Normalize and validate a server URL.
+  /// Throws [FormatException] with a user-friendly message on invalid input.
   Future<void> setServerUrl(String url) async {
     // Normalize URL
     url = url.trim();
-    if (url.endsWith('/')) url = url.substring(0, url.length - 1);
+    if (url.isEmpty) {
+      throw const FormatException('Please enter a server URL');
+    }
+    while (url.endsWith('/')) {
+      url = url.substring(0, url.length - 1);
+    }
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       url = 'https://$url';
+    }
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) {
+      throw const FormatException('Invalid server URL');
     }
     _serverUrl = url;
     await _storage.write(key: _serverUrlKey, value: url);
@@ -56,7 +67,12 @@ class AuthService extends ChangeNotifier {
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'username': username, 'password': password}),
     );
-    final data = jsonDecode(resp.body) as Map<String, dynamic>;
+    final Map<String, dynamic> data;
+    try {
+      data = jsonDecode(resp.body) as Map<String, dynamic>;
+    } catch (_) {
+      return {'success': false, 'error': 'Invalid server response'};
+    }
 
     if (resp.statusCode != 200) {
       return {'success': false, 'error': data['error'] ?? 'Login failed'};
@@ -77,7 +93,12 @@ class AuthService extends ChangeNotifier {
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'pending_token': _pendingToken, 'code': code}),
     );
-    final data = jsonDecode(resp.body) as Map<String, dynamic>;
+    final Map<String, dynamic> data;
+    try {
+      data = jsonDecode(resp.body) as Map<String, dynamic>;
+    } catch (_) {
+      return {'success': false, 'error': 'Invalid server response'};
+    }
 
     if (resp.statusCode != 200) {
       return {'success': false, 'error': data['error'] ?? 'Verification failed'};

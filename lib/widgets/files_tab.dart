@@ -27,6 +27,13 @@ class _FilesTabState extends State<FilesTab> {
   final Map<String, _DownloadState> _downloads = {};
   final Map<String, _DownloadState> _previews = {};
   Timer? _loadTimeout;
+  // Idle timeouts so a stalled transfer (lost chunk / missing ack) doesn't
+  // leave a spinner or progress bar stuck forever.
+  final Map<String, Timer> _downloadTimeouts = {};
+  final Map<String, Timer> _uploadTimeouts = {};
+  static const _downloadIdleTimeout = Duration(seconds: 60);
+  static const _uploadAckTimeout = Duration(seconds: 60);
+  static const _maxDownloadSize = 500 * 1024 * 1024; // 500 MB
 
   // Upload progress tracking
   final Map<String, _UploadProgress> _uploadProgress = {};
@@ -94,22 +101,37 @@ class _FilesTabState extends State<FilesTab> {
       if (dl == null) return;
       dl.chunks[chunkIndex] = data;
       if (totalChunks != null) dl.totalChunks = totalChunks;
-      if (mounted) setState(() {}); // update progress
-      if (done) _finishDownload(path, dl);
+      if (done) {
+        _finishDownload(path, dl);
+      } else {
+        // Reset the idle timeout each time progress is made.
+        _downloadTimeouts[path]?.cancel();
+        _downloadTimeouts[path] = Timer(_downloadIdleTimeout, () => _onDownloadTimeout(path));
+        if (mounted) setState(() {}); // update progress
+      }
     };
 
     _uploadAckHandler = (msg) {
       if (!mounted) return;
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       final path = payload['path'] as String?;
-      if (path != null) _uploadProgress.remove(path);
-      if (payload['success'] != true) {
-        final t = context.read<ThemeService>().current;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Upload error: ${payload['error']}'), backgroundColor: t.danger),
-        );
+      final t = context.read<ThemeService>().current;
+      if (path != null) {
+        _uploadTimeouts.remove(path)?.cancel();
+        final progress = _uploadProgress.remove(path);
+        final name = progress?.filename ?? path.split('/').last;
+        final messenger = ScaffoldMessenger.of(context)..hideCurrentSnackBar();
+        // Success feedback is shown ONLY after the server acks, so it can never
+        // contradict a later error for the same upload.
+        if (payload['success'] == true) {
+          messenger.showSnackBar(SnackBar(content: Text('Uploaded $name'), backgroundColor: t.success));
+        } else {
+          messenger.showSnackBar(SnackBar(content: Text('Upload failed: ${payload['error'] ?? 'unknown error'}'), backgroundColor: t.danger));
+        }
       }
       setState(() {});
+      // Refresh the listing once every upload has resolved.
+      if (_uploadProgress.isEmpty && _ws.connected) _navigate(_currentPath);
     };
 
     _connHandler = (_) {
@@ -172,7 +194,9 @@ class _FilesTabState extends State<FilesTab> {
       if (_imageExts.contains(ext)) {
         _showImagePreview(dl.filename, bytes, path);
       } else {
-        final text = String.fromCharCodes(bytes);
+        // Decode as UTF-8 (allowMalformed so binary-ish files don't throw)
+        // instead of String.fromCharCodes, which mangles multibyte characters.
+        final text = utf8.decode(bytes, allowMalformed: true);
         _showTextPreview(dl.filename, text, path);
       }
     } catch (e) {
@@ -266,50 +290,102 @@ class _FilesTabState extends State<FilesTab> {
   }
 
   Future<void> _finishDownload(String path, _DownloadState dl) async {
+    _downloadTimeouts.remove(path)?.cancel();
     try {
+      // Guard against silent corruption: if any chunk in the expected range is
+      // missing, fail loudly instead of writing a truncated file.
+      if (dl.totalChunks > 0) {
+        final missing = [
+          for (var i = 0; i < dl.totalChunks; i++)
+            if (!dl.chunks.containsKey(i)) i
+        ];
+        if (missing.isNotEmpty) {
+          throw Exception('incomplete transfer (${missing.length} missing chunk(s))');
+        }
+      }
       final sortedKeys = dl.chunks.keys.toList()..sort();
       final combined = sortedKeys.map((k) => dl.chunks[k]!).join('');
       final bytes = base64Decode(combined);
       final dir = await getApplicationDocumentsDirectory();
-      final file = File('${dir.path}/${dl.filename}');
+      final file = await _uniqueFile(dir.path, dl.filename);
       await file.writeAsBytes(bytes);
       _downloads.remove(path);
       if (mounted) {
         final t = context.read<ThemeService>().current;
         setState(() {});
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Downloaded ${dl.filename}'), backgroundColor: t.success,
-          action: SnackBarAction(label: 'Open', textColor: t.bgPrimary, onPressed: () => OpenFile.open(file.path)),
-        ));
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(
+            content: Text('Downloaded ${file.path.split('/').last}'), backgroundColor: t.success,
+            action: SnackBarAction(label: 'Open', textColor: t.bgPrimary, onPressed: () => OpenFile.open(file.path)),
+          ));
       }
     } catch (e) {
       _downloads.remove(path);
       if (mounted) {
         final t = context.read<ThemeService>().current;
         setState(() {});
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Download error: $e'), backgroundColor: t.danger));
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text('Download error: $e'), backgroundColor: t.danger));
       }
     }
   }
 
-  void _startDownload(String fullPath, String filename) {
+  /// Returns a non-existing File path, appending " (1)", " (2)", ... on collision
+  /// so a new download never silently overwrites an earlier one.
+  Future<File> _uniqueFile(String dirPath, String filename) async {
+    var file = File('$dirPath/$filename');
+    if (!await file.exists()) return file;
+    final dot = filename.lastIndexOf('.');
+    final base = dot > 0 ? filename.substring(0, dot) : filename;
+    final ext = dot > 0 ? filename.substring(dot) : '';
+    var i = 1;
+    while (await file.exists()) {
+      file = File('$dirPath/$base ($i)$ext');
+      i++;
+    }
+    return file;
+  }
+
+  void _onDownloadTimeout(String path) {
+    _downloadTimeouts.remove(path)?.cancel();
+    final dl = _downloads.remove(path);
+    if (dl == null || !mounted) return;
+    final t = context.read<ThemeService>().current;
+    setState(() {});
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text('Download timed out: ${dl.filename}'), backgroundColor: t.danger));
+  }
+
+  void _startDownload(String fullPath, String filename, [int size = 0]) {
     if (!_ws.connected) return;
     final t = context.read<ThemeService>().current;
+    if (size > _maxDownloadSize) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text('File too large to download (${_formatSize(size)})'), backgroundColor: t.danger));
+      return;
+    }
     _downloads[fullPath] = _DownloadState(filename);
     _ws.send('file_download_req', {'path': fullPath});
+    _downloadTimeouts[fullPath]?.cancel();
+    _downloadTimeouts[fullPath] = Timer(_downloadIdleTimeout, () => _onDownloadTimeout(fullPath));
     setState(() {});
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Downloading $filename...'), backgroundColor: t.bgSecondary),
-    );
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text('Downloading $filename...'), backgroundColor: t.bgSecondary));
   }
 
   Future<void> _pickAndUpload() async {
     if (!_ws.connected) return;
-    final t = context.read<ThemeService>().current;
     final result = await FilePicker.platform.pickFiles(allowMultiple: true);
     if (result == null) return;
     for (final pf in result.files) {
       if (pf.path == null) continue;
+      if (!_ws.connected) break;
       final file = File(pf.path!);
       final bytes = await file.readAsBytes();
       final filename = pf.name;
@@ -318,10 +394,11 @@ class _FilesTabState extends State<FilesTab> {
       final totalChunks = (bytes.length / chunkSize).ceil().clamp(1, 999999);
 
       _uploadProgress[targetPath] = _UploadProgress(filename, totalChunks);
-      setState(() {});
+      if (mounted) setState(() {});
 
       _ws.send('file_upload_start', {'path': targetPath, 'total_size': bytes.length, 'total_chunks': totalChunks});
       for (int i = 0; i < totalChunks; i++) {
+        if (!_ws.connected) break;
         final start = i * chunkSize;
         final end = (start + chunkSize).clamp(0, bytes.length);
         _ws.send('file_upload_chunk', {
@@ -331,14 +408,29 @@ class _FilesTabState extends State<FilesTab> {
         });
         _uploadProgress[targetPath]?.sentChunks = i + 1;
         if (mounted && i % 5 == 0) setState(() {});
+        // Yield periodically so the socket sink can drain instead of buffering
+        // the entire (base64-inflated) file in memory at once.
+        if (i % 8 == 7) await Future.delayed(const Duration(milliseconds: 8));
       }
-      if (mounted) {
-        _uploadProgress.remove(targetPath);
-        setState(() {});
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Uploaded $filename'), backgroundColor: t.success));
-      }
+      if (mounted) setState(() {});
+      // Don't claim success yet — wait for file_upload_ack. Arm a timeout so a
+      // missing ack clears the progress bar instead of hanging at 100%.
+      _uploadTimeouts[targetPath]?.cancel();
+      _uploadTimeouts[targetPath] = Timer(_uploadAckTimeout, () => _onUploadTimeout(targetPath));
     }
-    Future.delayed(const Duration(milliseconds: 500), () { if (mounted) _navigate(_currentPath); });
+  }
+
+  void _onUploadTimeout(String path) {
+    _uploadTimeouts.remove(path)?.cancel();
+    final progress = _uploadProgress.remove(path);
+    if (progress == null || !mounted) return;
+    final t = context.read<ThemeService>().current;
+    setState(() {});
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text('Upload timed out: ${progress.filename}'), backgroundColor: t.danger));
+    // Refresh once all uploads have resolved (the file may have partially landed).
+    if (_uploadProgress.isEmpty && _ws.connected) _navigate(_currentPath);
   }
 
   void _showPathDialog() {
@@ -366,6 +458,12 @@ class _FilesTabState extends State<FilesTab> {
   @override
   void dispose() {
     _loadTimeout?.cancel();
+    for (final t in _downloadTimeouts.values) {
+      t.cancel();
+    }
+    for (final t in _uploadTimeouts.values) {
+      t.cancel();
+    }
     _ws.off('file_list_res', _listHandler);
     _ws.off('file_download_chunk', _downloadHandler);
     _ws.off('file_upload_ack', _uploadAckHandler);
@@ -458,9 +556,9 @@ class _FilesTabState extends State<FilesTab> {
                                   onTap: () {
                                     if (isDir) { _navigate(fullPath); }
                                     else if (_canPreview(name, size)) { _requestPreview(fullPath, name, size); }
-                                    else { _startDownload(fullPath, name); }
+                                    else { _startDownload(fullPath, name, size); }
                                   },
-                                  onLongPress: !isDir ? () => _startDownload(fullPath, name) : null,
+                                  onLongPress: !isDir ? () => _startDownload(fullPath, name, size) : null,
                                   previewable: !isDir && _canPreview(name, size),
                                   downloading: isDownloading,
                                   downloadProgress: isDownloading ? _downloads[fullPath]!.progress : null,

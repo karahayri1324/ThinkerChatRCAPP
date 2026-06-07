@@ -53,6 +53,14 @@ class _SettingsSheetState extends State<SettingsSheet> {
 
   Future<void> _changePassword() async {
     final t = context.read<ThemeService>().current;
+    if (_oldPwCtrl.text.isEmpty || _newPwCtrl.text.isEmpty) {
+      setState(() { _pwMsg = 'All fields are required'; _pwMsgColor = t.danger; });
+      return;
+    }
+    if (_newPwCtrl.text.length < 6) {
+      setState(() { _pwMsg = 'New password must be at least 6 characters'; _pwMsgColor = t.danger; });
+      return;
+    }
     if (_newPwCtrl.text != _confirmPwCtrl.text) {
       setState(() { _pwMsg = 'Passwords do not match'; _pwMsgColor = t.danger; });
       return;
@@ -272,6 +280,16 @@ class _SettingsSheetState extends State<SettingsSheet> {
           child: SelectableText(_tfaSecret ?? '',
             style: TextStyle(color: t.textPrimary, fontFamily: 'monospace', fontSize: 14, letterSpacing: 2)),
         ),
+        const SizedBox(height: 12),
+        Text('Or paste this setup link into your authenticator app:',
+          style: TextStyle(color: t.textMuted, fontSize: 12)),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(color: t.bgPrimary, borderRadius: BorderRadius.circular(8), border: Border.all(color: t.border)),
+          child: SelectableText(_otpauthUri(),
+            style: TextStyle(color: t.textSecondary, fontFamily: 'monospace', fontSize: 11)),
+        ),
         const SizedBox(height: 16),
         _input(t, _tfaCodeCtrl, 'Enter 6-digit code',
             keyboardType: TextInputType.number, maxLength: 6,
@@ -287,6 +305,16 @@ class _SettingsSheetState extends State<SettingsSheet> {
         ],
       ],
     );
+  }
+
+  /// Standard otpauth:// provisioning URI (RFC 6238) so users can add the TOTP
+  /// account without hand-typing the base32 secret. (A scannable QR would need
+  /// an extra package such as qr_flutter.)
+  String _otpauthUri() {
+    final secret = _tfaSecret ?? '';
+    final user = context.read<AuthService>().username ?? 'user';
+    return 'otpauth://totp/ThinkerChat:${Uri.encodeComponent(user)}'
+        '?secret=$secret&issuer=ThinkerChat';
   }
 
   Widget _build2FADisable(AppThemeData t) {

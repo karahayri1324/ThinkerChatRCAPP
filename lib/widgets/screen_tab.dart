@@ -68,14 +68,17 @@ class _ScreenTabState extends State<ScreenTab> {
       setState(() => _streaming = false);
       final t = context.read<ThemeService>().current;
       final message = (msg['payload'] as Map<String, dynamic>?)?['message'] ?? 'Screen error';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message.toString()), backgroundColor: t.danger),
-      );
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(message.toString()), backgroundColor: t.danger));
     };
 
     _connHandler = (_) {
       if (mounted) {
-        setState(() => _checking = true);
+        // The server's stream did not survive the reconnect, so clear the
+        // local streaming flag — otherwise the UI shows "Waiting for frames..."
+        // forever and inputs go nowhere until the user manually taps Stop.
+        setState(() { _checking = true; _streaming = false; });
         _ws.send('screen_check');
       }
     };
@@ -95,22 +98,27 @@ class _ScreenTabState extends State<ScreenTab> {
   Future<void> _decodeFrame(String b64data) async {
     if (b64data.isEmpty) return;
     _decoding = true;
+    ui.Image? decoded;
     try {
       final bytes = base64Decode(b64data);
       final codec = await ui.instantiateImageCodec(Uint8List.fromList(bytes));
       final frame = await codec.getNextFrame();
+      decoded = frame.image;
       if (mounted) {
-        setState(() {
-          _currentFrame?.dispose();
-          _currentFrame = frame.image;
-        });
-      } else {
-        frame.image.dispose();
+        final old = _currentFrame;
+        _currentFrame = decoded;
+        decoded = null; // adopted — must not be disposed in finally
+        setState(() {});
+        old?.dispose();
       }
     } catch (e) {
       debugPrint('Frame decode error: $e');
+    } finally {
+      // Dispose the freshly decoded image if it was never adopted (widget
+      // unmounted, or setState threw) so native image memory can't leak.
+      decoded?.dispose();
+      _decoding = false;
     }
-    _decoding = false;
   }
 
   void _start() {
@@ -144,7 +152,8 @@ class _ScreenTabState extends State<ScreenTab> {
         (transformed.dx * scaleX).clamp(0, _naturalWidth.toDouble()).roundToDouble(),
         (transformed.dy * scaleY).clamp(0, _naturalHeight.toDouble()).roundToDouble(),
       );
-    } catch (_) {
+    } catch (e) {
+      debugPrint('Screen coord mapping failed (non-invertible transform): $e');
       return Offset.zero;
     }
   }
@@ -250,15 +259,17 @@ class _ScreenTabState extends State<ScreenTab> {
                                     panEnabled: true,
                                     scaleEnabled: true,
                                     child: Center(
-                                      child: GestureDetector(
-                                        behavior: HitTestBehavior.opaque,
-                                        onTapDown: _onTapDown,
-                                        onTapUp: _onTapUp,
-                                        onDoubleTapDown: _onDoubleTapDown,
-                                        child: CustomPaint(
-                                          key: _canvasKey,
-                                          painter: _FramePainter(_currentFrame!),
-                                          size: _calculateSize(context),
+                                      child: LayoutBuilder(
+                                        builder: (context, constraints) => GestureDetector(
+                                          behavior: HitTestBehavior.opaque,
+                                          onTapDown: _onTapDown,
+                                          onTapUp: _onTapUp,
+                                          onDoubleTapDown: _onDoubleTapDown,
+                                          child: CustomPaint(
+                                            key: _canvasKey,
+                                            painter: _FramePainter(_currentFrame!),
+                                            size: _calculateSize(constraints),
+                                          ),
                                         ),
                                       ),
                                     ),
@@ -305,7 +316,9 @@ class _ScreenTabState extends State<ScreenTab> {
                 child: Slider(
                   value: _fps, min: 1, max: 60,
                   activeColor: t.accent,
-                  onChanged: (v) {
+                  // Disabled while offline so adjustments can't be silently
+                  // dropped on a closed channel and lost on reconnect.
+                  onChanged: !wsConnected ? null : (v) {
                     setState(() => _fps = v);
                     if (_streaming) _sendSettings();
                   },
@@ -316,7 +329,7 @@ class _ScreenTabState extends State<ScreenTab> {
                 child: Slider(
                   value: _quality, min: 10, max: 95,
                   activeColor: t.accent,
-                  onChanged: (v) {
+                  onChanged: !wsConnected ? null : (v) {
                     setState(() => _quality = v);
                     if (_streaming) _sendSettings();
                   },
@@ -535,11 +548,16 @@ class _ScreenTabState extends State<ScreenTab> {
     );
   }
 
-  Size _calculateSize(BuildContext context) {
+  Size _calculateSize(BoxConstraints constraints) {
     if (_naturalWidth == 0 || _naturalHeight == 0) return Size.zero;
-    final screen = MediaQuery.of(context).size;
-    final maxW = screen.width;
-    final maxH = screen.height - 200;
+    // Fit within the ACTUAL available canvas area (from LayoutBuilder) rather
+    // than subtracting a hardcoded 200px from screen height, which breaks on
+    // small screens / split-screen / landscape (could go zero or negative).
+    final maxW = constraints.maxWidth;
+    final maxH = constraints.maxHeight;
+    if (maxW <= 0 || maxH <= 0 || !maxW.isFinite || !maxH.isFinite) {
+      return Size.zero;
+    }
     final ratio = _naturalWidth / _naturalHeight;
     double w, h;
     if (maxW / maxH > ratio) {

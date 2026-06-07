@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/ws_service.dart';
@@ -6,7 +7,12 @@ import '../services/theme_service.dart';
 import 'connection_banner.dart';
 
 class DashboardTab extends StatefulWidget {
-  const DashboardTab({super.key});
+  /// Index of this tab and a listenable of the currently-visible tab index, so
+  /// polling can pause while the dashboard is off-screen (IndexedStack keeps it
+  /// mounted otherwise). When null, polling always runs.
+  final ValueListenable<int>? activeTab;
+  final int tabIndex;
+  const DashboardTab({super.key, this.activeTab, this.tabIndex = 2});
 
   @override
   State<DashboardTab> createState() => _DashboardTabState();
@@ -28,6 +34,9 @@ class _DashboardTabState extends State<DashboardTab>
   @override
   bool get wantKeepAlive => true;
 
+  bool get _isVisible =>
+      widget.activeTab == null || widget.activeTab!.value == widget.tabIndex;
+
   @override
   void initState() {
     super.initState();
@@ -39,7 +48,17 @@ class _DashboardTabState extends State<DashboardTab>
       setState(() => _data = data);
     };
     _ws.on('sysinfo_res', _handler);
-    _startPolling();
+    widget.activeTab?.addListener(_onVisibilityChanged);
+    if (_isVisible) _startPolling();
+  }
+
+  void _onVisibilityChanged() {
+    if (_isVisible) {
+      if (_pollTimer == null) _startPolling();
+    } else {
+      _pollTimer?.cancel();
+      _pollTimer = null;
+    }
   }
 
   void _updateNetworkSpeed(Map<String, dynamic>? data) {
@@ -48,11 +67,13 @@ class _DashboardTabState extends State<DashboardTab>
     final now = DateTime.now();
     if (_prevBytesSent != null && _prevBytesRecv != null && _prevNetTime != null) {
       final dt = now.difference(_prevNetTime!).inMilliseconds / 1000;
-      if (dt > 0) {
-        final up = ((net['bytes_sent'] as num? ?? 0).toInt() - _prevBytesSent!) / dt;
-        final down = ((net['bytes_recv'] as num? ?? 0).toInt() - _prevBytesRecv!) / dt;
-        _upSpeed = '${_formatBytes(up.toInt())}/s';
-        _downSpeed = '${_formatBytes(down.toInt())}/s';
+      final sentDelta = (net['bytes_sent'] as num? ?? 0).toInt() - _prevBytesSent!;
+      final recvDelta = (net['bytes_recv'] as num? ?? 0).toInt() - _prevBytesRecv!;
+      // Skip on counter resets (negative deltas) which would otherwise render
+      // nonsensical speeds like "-500 MB/s".
+      if (dt > 0 && sentDelta >= 0 && recvDelta >= 0) {
+        _upSpeed = '${_formatBytes((sentDelta / dt).toInt())}/s';
+        _downSpeed = '${_formatBytes((recvDelta / dt).toInt())}/s';
       }
     }
     _prevBytesSent = (net['bytes_sent'] as num?)?.toInt();
@@ -69,6 +90,7 @@ class _DashboardTabState extends State<DashboardTab>
 
   @override
   void dispose() {
+    widget.activeTab?.removeListener(_onVisibilityChanged);
     _pollTimer?.cancel();
     _ws.off('sysinfo_res', _handler);
     super.dispose();
@@ -176,8 +198,9 @@ class _DashboardTabState extends State<DashboardTab>
       _infoRow(t, 'Hostname', d['hostname']?.toString() ?? '-'),
       _infoRow(t, 'Platform', d['platform']?.toString() ?? '-'),
       if (uptime.isNotEmpty) _infoRow(t, 'Uptime', uptime),
-      if (d['battery'] != null)
-        _infoRow(t, 'Battery', '${d['battery']['percent']}%${d['battery']['plugged'] == true ? ' (plugged)' : ''}'),
+      if (d['battery'] is Map)
+        _infoRow(t, 'Battery',
+            '${(d['battery'] as Map)['percent'] ?? '?'}%${(d['battery'] as Map)['plugged'] == true ? ' (plugged)' : ''}'),
     ]));
   }
 
@@ -239,7 +262,7 @@ class _DashboardTabState extends State<DashboardTab>
       final gpuUtil = (g['gpu_util'] as num?)?.toDouble() ?? 0;
       final memPercent = (g['mem_percent'] as num?)?.toDouble() ?? 0;
       final temp = (g['temp'] as num?)?.toDouble() ?? 0;
-      return Padding(padding: const EdgeInsets.only(bottom: 10), child: _card(t, 'GPU ${g['index']}: ${g['name']}',
+      return Padding(padding: const EdgeInsets.only(bottom: 10), child: _card(t, 'GPU ${g['index'] ?? '?'}: ${g['name'] ?? 'Unknown'}',
         Column(children: [
           _infoRow(t, 'GPU Usage', '${gpuUtil.toStringAsFixed(0)}%'), _progressBar(t, gpuUtil),
           const SizedBox(height: 8),

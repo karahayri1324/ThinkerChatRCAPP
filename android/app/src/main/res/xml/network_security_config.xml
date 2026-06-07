@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Public/relay servers must use HTTPS/WSS. Cleartext (http:// / ws://) is
+  permitted ONLY for local development hosts: localhost, the loopback address,
+  and the Android emulator's host alias (10.0.2.2). Everything else is encrypted.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

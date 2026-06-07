@@ -54,7 +54,10 @@ class _LoginScreenState extends State<LoginScreen> {
         Navigator.pushReplacementNamed(context, '/home');
       }
     } catch (e) {
-      if (mounted) setState(() => _error = 'Connection error: $e');
+      // Surface URL-validation messages clearly; never leak raw exception text.
+      if (mounted) {
+        setState(() => _error = e is FormatException ? e.message : 'Connection error');
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -177,7 +180,9 @@ class _LoginScreenState extends State<LoginScreen> {
           keyboardType: TextInputType.number,
           maxLength: 6,
           inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-          onChanged: (val) { if (val.length == 6) _verify2FA(); },
+          // Auto-submit once, and never while a verify is already in flight, so
+          // a quick correction can't fire a stale code mid-edit.
+          onChanged: (val) { if (val.length == 6 && !_loading) _verify2FA(); },
         ),
         const SizedBox(height: 16),
         SizedBox(

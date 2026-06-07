@@ -131,10 +131,13 @@ class WsService extends ChangeNotifier {
   }
 
   void send(String type, [Map<String, dynamic> payload = const {}]) {
-    if (_channel == null || !_connected) return;
+    // Capture the channel locally so it can't be nulled out from under us
+    // by a concurrent disconnect between the guard and the add().
+    final channel = _channel;
+    if (channel == null || !_connected) return;
     try {
       final msg = jsonEncode({'type': type, 'payload': payload});
-      _channel!.sink.add(msg);
+      channel.sink.add(msg);
     } catch (e) {
       debugPrint('WS send error: $e');
       _connected = false;
