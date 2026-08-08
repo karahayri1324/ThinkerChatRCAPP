@@ -79,7 +79,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _ws.on('agent_status', _onAgentStatus);
     _ws.on('error', _onError);
 
+    _ws.onRepeatedRejections = _probeSession;
     _ws.connect(auth.wsUrl);
+  }
+
+  /// The WS was rejected several times in a row without a single message —
+  /// ask the REST API whether our token is still valid. If it is dead, expire
+  /// the session (AuthService then routes the app back to the login screen);
+  /// if the server is just down, keep reconnecting quietly.
+  Future<void> _probeSession() async {
+    if (!mounted) return;
+    final auth = context.read<AuthService>();
+    final validity = await auth.validateSession();
+    if (validity == SessionValidity.invalid) {
+      auth.markSessionExpired();
+    } else {
+      // Server reachable-but-flaky or fully down: allow a future streak of
+      // failures to trigger another probe.
+      _ws.resetRejectionProbe();
+    }
   }
 
   void _logout() {
@@ -225,15 +243,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      // Force reconnect on resume to recover from any stale WS
-      // left over from backgrounding or network changes.
-      _ws.forceReconnect();
+      // A JWT can expire while the app is backgrounded: go straight to the
+      // login screen instead of reconnecting with a dead token.
+      final auth = context.read<AuthService>();
+      if (!auth.hasValidSession) {
+        auth.markSessionExpired();
+        return;
+      }
+      // Only reconnect when the link is actually down or stale — an
+      // unconditional reconnect would kill every server-side shell and the
+      // screen stream on every app switch.
+      _ws.reconnectIfStale();
     }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _ws.onRepeatedRejections = null;
     _ws.off('_connected', _onConnected);
     _ws.off('_disconnected', _onDisconnected);
     _ws.off('agent_status', _onAgentStatus);

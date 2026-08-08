@@ -18,7 +18,10 @@ if (hasReleaseKeystore) {
 
 android {
     namespace = "com.thinkerchat.rc_app"
-    compileSdk = flutter.compileSdkVersion
+    // Pinned to 35 (not flutter.compileSdkVersion = 34): file_picker pulls in
+    // flutter_plugin_android_lifecycle, which is compiled against SDK 35 and
+    // fails the JdkImageTransform step under compileSdk 34.
+    compileSdk = 35
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -36,7 +39,8 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        // Google Play requires new uploads to target API 35.
+        targetSdk = 35
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Exclude everything from cloud backup and device-to-device transfer (Android 12+).
+  flutter_secure_storage values are encrypted with a Keystore key that is NOT
+  backed up, so restoring the prefs on another install produces undecryptable
+  data — the app would silently lose the auth session. Excluding backup entirely
+  keeps sessions consistent: a fresh install simply asks the user to log in.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="file" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="file" path="." />
+    </device-transfer>
+</data-extraction-rules>

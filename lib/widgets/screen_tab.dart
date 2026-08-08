@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:open_file/open_file.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import '../services/ws_service.dart';
 import '../services/theme_service.dart';
@@ -27,6 +30,24 @@ class _ScreenTabState extends State<ScreenTab> {
   int _naturalHeight = 0;
   bool _decoding = false;
   bool _showControls = true;
+  Offset? _pendingDownAt;
+
+  // Screen-check timeout: without it an agent that never answers leaves the
+  // tab on a permanent spinner with no way out.
+  Timer? _checkTimeout;
+  static const _checkTimeoutDuration = Duration(seconds: 10);
+
+  // Live stream stats + stall detection.
+  Timer? _statsTimer;
+  int _framesSinceTick = 0;
+  double _liveFps = 0;
+  int _bytesSinceTick = 0;
+  double _liveKbps = 0;
+  DateTime? _lastFrameAt;
+  bool get _stalled =>
+      _streaming &&
+      _lastFrameAt != null &&
+      DateTime.now().difference(_lastFrameAt!) > const Duration(seconds: 5);
 
   final TransformationController _transformCtrl = TransformationController();
   final TextEditingController _typeCtrl = TextEditingController();
@@ -47,15 +68,24 @@ class _ScreenTabState extends State<ScreenTab> {
     _frameHandler = (msg) {
       if (!mounted) return;
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
-      _naturalWidth = (payload['width'] as num?)?.toInt() ?? 0;
-      _naturalHeight = (payload['height'] as num?)?.toInt() ?? 0;
+      final data = payload['data'] as String? ?? '';
+      _lastFrameAt = DateTime.now();
+      _framesSinceTick++;
+      _bytesSinceTick += data.length;
       if (!_decoding) {
-        _decodeFrame(payload['data'] as String? ?? '');
+        // Dimensions are adopted together with the decoded image so the painted
+        // frame and the tap-coordinate mapping can never disagree.
+        _decodeFrame(
+          data,
+          (payload['width'] as num?)?.toInt() ?? 0,
+          (payload['height'] as num?)?.toInt() ?? 0,
+        );
       }
     };
 
     _checkHandler = (msg) {
       if (!mounted) return;
+      _checkTimeout?.cancel();
       final payload = msg['payload'] as Map<String, dynamic>? ?? {};
       setState(() {
         _available = payload['available'] == true;
@@ -65,7 +95,13 @@ class _ScreenTabState extends State<ScreenTab> {
 
     _errorHandler = (msg) {
       if (!mounted) return;
-      setState(() => _streaming = false);
+      _checkTimeout?.cancel();
+      // Clear _checking too: an agent that answers screen_check with an error
+      // would otherwise leave the tab spinning forever.
+      setState(() {
+        _streaming = false;
+        _checking = false;
+      });
       final t = context.read<ThemeService>().current;
       final message = (msg['payload'] as Map<String, dynamic>?)?['message'] ?? 'Screen error';
       ScaffoldMessenger.of(context)
@@ -78,8 +114,8 @@ class _ScreenTabState extends State<ScreenTab> {
         // The server's stream did not survive the reconnect, so clear the
         // local streaming flag — otherwise the UI shows "Waiting for frames..."
         // forever and inputs go nowhere until the user manually taps Stop.
-        setState(() { _checking = true; _streaming = false; });
-        _ws.send('screen_check');
+        setState(() { _streaming = false; });
+        _sendCheck();
       }
     };
 
@@ -89,13 +125,52 @@ class _ScreenTabState extends State<ScreenTab> {
     _ws.on('_connected', _connHandler);
 
     if (_ws.connected) {
-      _ws.send('screen_check');
+      _sendCheck();
     } else {
       _checking = false;
     }
   }
 
-  Future<void> _decodeFrame(String b64data) async {
+  /// Ask the agent whether screen sharing is available, with a timeout so an
+  /// unanswered check can never strand the tab on a spinner.
+  void _sendCheck() {
+    _checkTimeout?.cancel();
+    setState(() => _checking = true);
+    _ws.send('screen_check');
+    _checkTimeout = Timer(_checkTimeoutDuration, () {
+      if (!mounted || !_checking) return;
+      setState(() {
+        _checking = false;
+        _available = false;
+      });
+    });
+  }
+
+  void _startStatsTimer() {
+    _statsTimer?.cancel();
+    _framesSinceTick = 0;
+    _bytesSinceTick = 0;
+    _statsTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {
+        _liveFps = _framesSinceTick.toDouble();
+        // Payloads are base64, so raw bytes are ~3/4 of the string length.
+        _liveKbps = _bytesSinceTick * 0.75 / 1024;
+        _framesSinceTick = 0;
+        _bytesSinceTick = 0;
+      });
+    });
+  }
+
+  void _stopStatsTimer() {
+    _statsTimer?.cancel();
+    _statsTimer = null;
+    _liveFps = 0;
+    _liveKbps = 0;
+    _lastFrameAt = null;
+  }
+
+  Future<void> _decodeFrame(String b64data, int width, int height) async {
     if (b64data.isEmpty) return;
     _decoding = true;
     ui.Image? decoded;
@@ -107,6 +182,10 @@ class _ScreenTabState extends State<ScreenTab> {
       if (mounted) {
         final old = _currentFrame;
         _currentFrame = decoded;
+        if (width > 0 && height > 0) {
+          _naturalWidth = width;
+          _naturalHeight = height;
+        }
         decoded = null; // adopted — must not be disposed in finally
         setState(() {});
         old?.dispose();
@@ -128,39 +207,80 @@ class _ScreenTabState extends State<ScreenTab> {
       'quality': _quality.toInt(),
       'max_width': 1920,
     });
+    _lastFrameAt = DateTime.now();
+    _startStatsTimer();
     setState(() => _streaming = true);
   }
 
   void _stop() {
     _ws.send('screen_stop');
+    _stopStatsTimer();
     setState(() => _streaming = false);
   }
 
+  /// Save the currently displayed frame as a PNG in the app's documents
+  /// directory (visible in the Files tab's downloads manager).
+  Future<void> _saveScreenshot() async {
+    final frame = _currentFrame;
+    if (frame == null) return;
+    final t = context.read<ThemeService>().current;
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final data = await frame.toByteData(format: ui.ImageByteFormat.png);
+      if (data == null) throw Exception('encode failed');
+      final dir = await getApplicationDocumentsDirectory();
+      final stamp = DateTime.now()
+          .toIso8601String()
+          .replaceAll(RegExp(r'[:.]'), '-')
+          .substring(0, 19);
+      final file = File('${dir.path}/screenshot-$stamp.png');
+      await file.writeAsBytes(data.buffer.asUint8List());
+      if (!mounted) return;
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text('Saved ${file.path.split('/').last}'),
+          backgroundColor: t.success,
+          action: SnackBarAction(
+            label: 'Open',
+            textColor: t.bgPrimary,
+            onPressed: () => OpenFile.open(file.path),
+          ),
+        ));
+    } catch (e) {
+      if (!mounted) return;
+      messenger
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+            content: Text('Screenshot failed: $e'), backgroundColor: t.danger));
+    }
+  }
+
+  /// Map a tap on the canvas to remote screen pixels.
+  ///
+  /// The GestureDetector sits INSIDE InteractiveViewer's transform, so Flutter
+  /// has already converted the pointer through the render transform chain:
+  /// `localPosition` is in the canvas's own untransformed space. Applying the
+  /// inverse matrix again here would double-transform and send clicks to the
+  /// wrong place whenever the view is zoomed or panned.
   Offset _toRemote(Offset local) {
     if (_naturalWidth == 0 || _naturalHeight == 0) return Offset.zero;
     final box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null) return Offset.zero;
     final canvasSize = box.size;
     if (canvasSize.width == 0 || canvasSize.height == 0) return Offset.zero;
-    final matrix = _transformCtrl.value;
-    try {
-      final inverted = Matrix4.inverted(matrix);
-      final transformed = MatrixUtils.transformPoint(inverted, local);
-      final scaleX = _naturalWidth / canvasSize.width;
-      final scaleY = _naturalHeight / canvasSize.height;
-      return Offset(
-        (transformed.dx * scaleX).clamp(0, _naturalWidth.toDouble()).roundToDouble(),
-        (transformed.dy * scaleY).clamp(0, _naturalHeight.toDouble()).roundToDouble(),
-      );
-    } catch (e) {
-      debugPrint('Screen coord mapping failed (non-invertible transform): $e');
-      return Offset.zero;
-    }
+    final scaleX = _naturalWidth / canvasSize.width;
+    final scaleY = _naturalHeight / canvasSize.height;
+    return Offset(
+      (local.dx * scaleX).clamp(0, _naturalWidth.toDouble()).roundToDouble(),
+      (local.dy * scaleY).clamp(0, _naturalHeight.toDouble()).roundToDouble(),
+    );
   }
 
   void _onTapDown(TapDownDetails d) {
     if (!_streaming) return;
     final remote = _toRemote(d.localPosition);
+    _pendingDownAt = remote;
     _ws.send('screen_input', {
       'input_type': 'mouse_down',
       'data': {'x': remote.dx.toInt(), 'y': remote.dy.toInt(), 'button': 1},
@@ -169,10 +289,24 @@ class _ScreenTabState extends State<ScreenTab> {
 
   void _onTapUp(TapUpDetails d) {
     if (!_streaming) return;
+    _pendingDownAt = null;
     final remote = _toRemote(d.localPosition);
     _ws.send('screen_input', {
       'input_type': 'mouse_up',
       'data': {'x': remote.dx.toInt(), 'y': remote.dy.toInt(), 'button': 1},
+    });
+  }
+
+  /// The tap lost the gesture arena (the finger moved into an InteractiveViewer
+  /// pan/pinch) after onTapDown already sent a mouse_down. Without a matching
+  /// mouse_up the remote button stays held and the desktop drag-selects.
+  void _onTapCancel() {
+    final down = _pendingDownAt;
+    _pendingDownAt = null;
+    if (!_streaming || down == null) return;
+    _ws.send('screen_input', {
+      'input_type': 'mouse_up',
+      'data': {'x': down.dx.toInt(), 'y': down.dy.toInt(), 'button': 1},
     });
   }
 
@@ -216,6 +350,8 @@ class _ScreenTabState extends State<ScreenTab> {
 
   @override
   void dispose() {
+    _checkTimeout?.cancel();
+    _statsTimer?.cancel();
     _ws.off('screen_frame', _frameHandler);
     _ws.off('screen_check_res', _checkHandler);
     _ws.off('screen_error', _errorHandler);
@@ -264,6 +400,7 @@ class _ScreenTabState extends State<ScreenTab> {
                                           behavior: HitTestBehavior.opaque,
                                           onTapDown: _onTapDown,
                                           onTapUp: _onTapUp,
+                                          onTapCancel: _onTapCancel,
                                           onDoubleTapDown: _onDoubleTapDown,
                                           child: CustomPaint(
                                             key: _canvasKey,
@@ -275,23 +412,76 @@ class _ScreenTabState extends State<ScreenTab> {
                                     ),
                                   ),
                                 ),
-                                // Toggle controls button
-                                Positioned(
-                                  top: 8, right: 8,
-                                  child: Material(
-                                    color: Colors.black54,
-                                    borderRadius: BorderRadius.circular(20),
-                                    child: InkWell(
-                                      borderRadius: BorderRadius.circular(20),
-                                      onTap: () => setState(() => _showControls = !_showControls),
-                                      child: Padding(
-                                        padding: const EdgeInsets.all(8),
-                                        child: Icon(
-                                          _showControls ? Icons.expand_less : Icons.expand_more,
-                                          color: Colors.white70, size: 20,
+                                // Live stats + stall warning
+                                if (_streaming)
+                                  Positioned(
+                                    top: 8,
+                                    left: 8,
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: Colors.black54,
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: Text(
+                                        _stalled
+                                            ? 'STREAM STALLED'
+                                            : '${_liveFps.toStringAsFixed(0)} fps · '
+                                                '${_liveKbps.toStringAsFixed(0)} KB/s · '
+                                                '${_naturalWidth}x$_naturalHeight',
+                                        style: TextStyle(
+                                          color: _stalled
+                                              ? t.danger
+                                              : Colors.white70,
+                                          fontSize: 10,
+                                          fontFamily: 'monospace',
+                                          fontWeight: _stalled
+                                              ? FontWeight.bold
+                                              : FontWeight.normal,
                                         ),
                                       ),
                                     ),
+                                  ),
+                                // Screenshot + toggle controls buttons
+                                Positioned(
+                                  top: 8, right: 8,
+                                  child: Row(
+                                    children: [
+                                      Material(
+                                        color: Colors.black54,
+                                        borderRadius: BorderRadius.circular(20),
+                                        child: InkWell(
+                                          borderRadius: BorderRadius.circular(20),
+                                          onTap: _saveScreenshot,
+                                          child: const Padding(
+                                            padding: EdgeInsets.all(8),
+                                            child: Icon(Icons.photo_camera,
+                                                color: Colors.white70, size: 20),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Material(
+                                        color: Colors.black54,
+                                        borderRadius: BorderRadius.circular(20),
+                                        child: InkWell(
+                                          borderRadius: BorderRadius.circular(20),
+                                          onTap: () => setState(
+                                              () => _showControls = !_showControls),
+                                          child: Padding(
+                                            padding: const EdgeInsets.all(8),
+                                            child: Icon(
+                                              _showControls
+                                                  ? Icons.expand_less
+                                                  : Icons.expand_more,
+                                              color: Colors.white70,
+                                              size: 20,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ],
@@ -359,10 +549,7 @@ class _ScreenTabState extends State<ScreenTab> {
                 TextButton.icon(
                   icon: Icon(Icons.refresh, size: 16, color: t.textMuted),
                   label: Text('Re-check', style: TextStyle(color: t.textMuted, fontSize: 12)),
-                  onPressed: () {
-                    setState(() => _checking = true);
-                    _ws.send('screen_check');
-                  },
+                  onPressed: _sendCheck,
                 ),
               const Spacer(),
               Text(

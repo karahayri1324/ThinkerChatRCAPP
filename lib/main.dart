@@ -8,6 +8,11 @@ import 'screens/splash_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/home_screen.dart';
 
+/// Global navigator so session-expiry (which can be detected from any HTTP
+/// call or the WS layer) can return the app to the login screen no matter
+/// which screen is on top.
+final navigatorKey = GlobalKey<NavigatorState>();
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
@@ -16,19 +21,43 @@ void main() {
     systemNavigationBarColor: Color(0xFF1a1b26),
     systemNavigationBarIconBrightness: Brightness.light,
   ));
-  runApp(const RCApp());
+
+  final auth = AuthService();
+  final ws = WsService();
+  final themeSvc = ThemeService();
+
+  // When the server rejects our token, drop the socket and land on the login
+  // screen (with the session notice) from wherever the user happens to be.
+  auth.onSessionExpired = () {
+    ws.disconnect();
+    final nav = navigatorKey.currentState;
+    if (nav != null) {
+      nav.pushNamedAndRemoveUntil('/login', (route) => false);
+    }
+  };
+
+  runApp(RCApp(auth: auth, ws: ws, themeSvc: themeSvc));
 }
 
 class RCApp extends StatelessWidget {
-  const RCApp({super.key});
+  final AuthService auth;
+  final WsService ws;
+  final ThemeService themeSvc;
+
+  const RCApp({
+    super.key,
+    required this.auth,
+    required this.ws,
+    required this.themeSvc,
+  });
 
   @override
   Widget build(BuildContext context) {
     return MultiProvider(
       providers: [
-        ChangeNotifierProvider(create: (_) => AuthService()),
-        ChangeNotifierProvider(create: (_) => WsService()),
-        ChangeNotifierProvider(create: (_) => ThemeService()),
+        ChangeNotifierProvider.value(value: auth),
+        ChangeNotifierProvider.value(value: ws),
+        ChangeNotifierProvider.value(value: themeSvc),
       ],
       child: Consumer<ThemeService>(
         builder: (context, themeSvc, _) {
@@ -42,6 +71,7 @@ class RCApp extends StatelessWidget {
           return MaterialApp(
             title: 'RemoteController',
             debugShowCheckedModeBanner: false,
+            navigatorKey: navigatorKey,
             theme: t.toFlutterTheme(),
             initialRoute: '/splash',
             routes: {

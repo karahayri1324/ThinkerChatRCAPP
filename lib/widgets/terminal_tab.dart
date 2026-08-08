@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:xterm/xterm.dart';
+import '../services/command_history_service.dart';
 import '../services/ws_service.dart';
 import '../services/theme_service.dart';
 import '../services/terminal_history_service.dart';
@@ -28,11 +29,13 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
   int _nextId = 1;
   late WsService _ws;
   late void Function(Map<String, dynamic>) _outputHandler;
+  late void Function(Map<String, dynamic>) _connHandler;
 
   // Command input
   final TextEditingController _inputCtrl = TextEditingController();
   final FocusNode _inputFocusNode = FocusNode();
   bool _useInputBar = true;
+  final CommandHistoryService _cmdHistory = CommandHistoryService();
 
   // History save debounce
   Timer? _saveTimer;
@@ -60,6 +63,23 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
       }
     };
     _ws.on('shell_output', _outputHandler);
+    // Server-side shells live only as long as the WS connection: (re)create
+    // every shell when a connection is (re)established. This also covers the
+    // cold start, where initState runs BEFORE HomeScreen's post-frame connect
+    // and the initial shell_create below is dropped by the closed socket.
+    _connHandler = (_) {
+      if (!mounted) return;
+      for (final s in _shells) {
+        _ws.send('shell_create', {'shell_id': s.id});
+        _ws.send('shell_resize', {
+          'shell_id': s.id,
+          'cols': s.terminal.viewWidth,
+          'rows': s.terminal.viewHeight,
+        });
+      }
+    };
+    _ws.on('_connected', _connHandler);
+    _cmdHistory.load();
     _createShell();
   }
 
@@ -137,8 +157,16 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
     final entry = _shells[index];
     _ws.send('shell_close', {'shell_id': entry.id});
     entry.focusNode.dispose();
+    // An explicitly closed shell must not leave scrollback behind: shell ids
+    // are reused across app restarts, so a future shell would replay it.
+    _pendingSaves.remove(entry.id);
+    TerminalHistoryService.clearShell(entry.id);
     setState(() {
       _shells.removeAt(index);
+      // Keep the same shell active when it survives the close.
+      if (index < _activeIndex) {
+        _activeIndex--;
+      }
       if (_activeIndex >= _shells.length) {
         _activeIndex = _shells.length - 1;
       }
@@ -162,7 +190,24 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
     HapticFeedback.lightImpact();
     final shellId = _shells[_activeIndex].id;
     _ws.send('shell_input', {'shell_id': shellId, 'data': '$text\r'});
+    _cmdHistory.add(text);
     _inputCtrl.clear();
+  }
+
+  void _historyPrevious() {
+    final cmd = _cmdHistory.previous();
+    if (cmd == null) return;
+    HapticFeedback.selectionClick();
+    _inputCtrl.text = cmd;
+    _inputCtrl.selection = TextSelection.collapsed(offset: cmd.length);
+  }
+
+  void _historyNext() {
+    final cmd = _cmdHistory.next();
+    if (cmd == null) return;
+    HapticFeedback.selectionClick();
+    _inputCtrl.text = cmd;
+    _inputCtrl.selection = TextSelection.collapsed(offset: cmd.length);
   }
 
   Future<void> _pasteClipboard() async {
@@ -211,6 +256,7 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
       TerminalHistoryService.saveOutput(entry.key, entry.value);
     }
     _ws.off('shell_output', _outputHandler);
+    _ws.off('_connected', _connHandler);
     _inputCtrl.dispose();
     _inputFocusNode.dispose();
     for (final s in _shells) {
@@ -375,7 +421,11 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
       child: Row(
         children: [
           Text('\$', style: TextStyle(color: t.accent, fontSize: 16, fontWeight: FontWeight.bold, fontFamily: 'monospace')),
-          const SizedBox(width: 8),
+          const SizedBox(width: 4),
+          // Command history recall (older / newer).
+          _historyBtn(t, Icons.keyboard_arrow_up, _historyPrevious, 'Previous command'),
+          _historyBtn(t, Icons.keyboard_arrow_down, _historyNext, 'Next command'),
+          const SizedBox(width: 4),
           Expanded(
             child: TextField(
               controller: _inputCtrl,
@@ -456,6 +506,20 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
               _kbButton(t, '\\', '\\', h: buttonHeight, fs: fontSize),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _historyBtn(AppThemeData t, IconData icon, VoidCallback onTap, String tooltip) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
+          child: Icon(icon, size: 20, color: t.textMuted),
         ),
       ),
     );

@@ -20,7 +20,7 @@ class _SplashScreenState extends State<SplashScreen>
     super.initState();
     _controller = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 2500),
+      duration: const Duration(milliseconds: 1400),
     );
     _progressAnim = Tween<double>(begin: 0, end: 1).animate(
       CurvedAnimation(parent: _controller, curve: Curves.easeOut),
@@ -32,14 +32,25 @@ class _SplashScreenState extends State<SplashScreen>
   Future<void> _initApp() async {
     final auth = context.read<AuthService>();
     final themeSvc = context.read<ThemeService>();
-    await Future.wait([auth.init(), themeSvc.init()]);
-    await Future.delayed(const Duration(milliseconds: 2800));
-    if (!mounted) return;
-    if (auth.isLoggedIn && auth.serverUrl != null) {
-      Navigator.pushReplacementNamed(context, '/home');
-    } else {
-      Navigator.pushReplacementNamed(context, '/login');
+    // Init must NEVER leave the user stuck on the splash screen: a flaky
+    // secure-storage read or prefs error degrades to the login screen instead.
+    var loggedIn = false;
+    try {
+      await Future.wait([auth.init(), themeSvc.init()])
+          .timeout(const Duration(seconds: 8));
+      loggedIn = auth.isLoggedIn && auth.serverUrl != null;
+      if (loggedIn && !auth.hasValidSession) {
+        // The stored JWT is already expired — go straight to login with a
+        // notice instead of opening a home screen that can never connect.
+        await auth.markSessionExpired();
+        loggedIn = false;
+      }
+    } catch (e) {
+      debugPrint('Splash init error: $e');
     }
+    await Future.delayed(const Duration(milliseconds: 1200));
+    if (!mounted) return;
+    Navigator.pushReplacementNamed(context, loggedIn ? '/home' : '/login');
   }
 
   @override

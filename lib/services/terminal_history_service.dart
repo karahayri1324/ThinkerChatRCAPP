@@ -6,8 +6,22 @@ class TerminalHistoryService {
   static const _maxShells = 10;
   static const _maxLinesPerShell = 500;
 
+  // All mutations read-modify-write the same prefs key; serialize them so
+  // concurrent saves (e.g. dispose() flushing several shells at once) can't
+  // interleave and drop each other's output.
+  static Future<void> _queue = Future.value();
+
+  static Future<T> _serialized<T>(Future<T> Function() action) {
+    final result = _queue.then((_) => action());
+    _queue = result.then((_) {}, onError: (_) {});
+    return result;
+  }
+
   /// Save terminal output for a shell
-  static Future<void> saveOutput(String shellId, String data) async {
+  static Future<void> saveOutput(String shellId, String data) =>
+      _serialized(() => _saveOutput(shellId, data));
+
+  static Future<void> _saveOutput(String shellId, String data) async {
     final prefs = await SharedPreferences.getInstance();
     final history = _loadMap(prefs);
 
@@ -57,18 +71,18 @@ class TerminalHistoryService {
   }
 
   /// Clear history for a shell
-  static Future<void> clearShell(String shellId) async {
-    final prefs = await SharedPreferences.getInstance();
-    final history = _loadMap(prefs);
-    history.remove(shellId);
-    await prefs.setString(_historyKey, jsonEncode(history));
-  }
+  static Future<void> clearShell(String shellId) => _serialized(() async {
+        final prefs = await SharedPreferences.getInstance();
+        final history = _loadMap(prefs);
+        history.remove(shellId);
+        await prefs.setString(_historyKey, jsonEncode(history));
+      });
 
   /// Clear all history
-  static Future<void> clearAll() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_historyKey);
-  }
+  static Future<void> clearAll() => _serialized(() async {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove(_historyKey);
+      });
 
   static Map<String, String> _loadMap(SharedPreferences prefs) {
     final raw = prefs.getString(_historyKey);
