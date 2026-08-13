@@ -2,9 +2,18 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// Persistent history of commands sent from the terminal input bar,
 /// navigable with the up/down arrows next to the field.
+///
+/// Use [instance] rather than constructing copies: the in-memory list is the
+/// write-through cache for the stored one, so a second instance clearing
+/// storage would be silently undone by the first instance's next write.
 class CommandHistoryService {
   static const _key = 'command_history';
   static const _maxEntries = 50;
+
+  /// App-wide instance shared by the terminal tab and the settings sheet.
+  static final CommandHistoryService instance = CommandHistoryService._();
+
+  CommandHistoryService._();
 
   final List<String> _entries = [];
   int _cursor = -1; // -1 = not navigating (below the newest entry)

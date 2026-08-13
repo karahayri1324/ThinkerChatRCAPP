@@ -30,7 +30,6 @@ class _ScreenTabState extends State<ScreenTab> {
   int _naturalHeight = 0;
   bool _decoding = false;
   bool _showControls = true;
-  Offset? _pendingDownAt;
 
   // Screen-check timeout: without it an agent that never answers leaves the
   // tab on a permanent spinner with no way out.
@@ -57,6 +56,7 @@ class _ScreenTabState extends State<ScreenTab> {
   late void Function(Map<String, dynamic>) _checkHandler;
   late void Function(Map<String, dynamic>) _errorHandler;
   late void Function(Map<String, dynamic>) _connHandler;
+  late void Function(Map<String, dynamic>) _disconnHandler;
 
   final GlobalKey _canvasKey = GlobalKey();
 
@@ -96,6 +96,7 @@ class _ScreenTabState extends State<ScreenTab> {
     _errorHandler = (msg) {
       if (!mounted) return;
       _checkTimeout?.cancel();
+      _stopStatsTimer();
       // Clear _checking too: an agent that answers screen_check with an error
       // would otherwise leave the tab spinning forever.
       setState(() {
@@ -114,18 +115,32 @@ class _ScreenTabState extends State<ScreenTab> {
         // The server's stream did not survive the reconnect, so clear the
         // local streaming flag — otherwise the UI shows "Waiting for frames..."
         // forever and inputs go nowhere until the user manually taps Stop.
+        _stopStatsTimer();
         setState(() { _streaming = false; });
         _sendCheck();
       }
+    };
+
+    // A dropped connection kills the server-side stream: stop the 1 Hz stats
+    // rebuild immediately instead of ticking for the whole outage.
+    _disconnHandler = (_) {
+      if (!mounted) return;
+      _checkTimeout?.cancel();
+      _stopStatsTimer();
+      setState(() {
+        _streaming = false;
+        _checking = false;
+      });
     };
 
     _ws.on('screen_frame', _frameHandler);
     _ws.on('screen_check_res', _checkHandler);
     _ws.on('screen_error', _errorHandler);
     _ws.on('_connected', _connHandler);
+    _ws.on('_disconnected', _disconnHandler);
 
     if (_ws.connected) {
-      _sendCheck();
+      _beginCheck();
     } else {
       _checking = false;
     }
@@ -134,8 +149,15 @@ class _ScreenTabState extends State<ScreenTab> {
   /// Ask the agent whether screen sharing is available, with a timeout so an
   /// unanswered check can never strand the tab on a spinner.
   void _sendCheck() {
+    _beginCheck();
+    setState(() {});
+  }
+
+  /// The state mutation without the rebuild, so initState can arm a check
+  /// before the first frame (setState there would be a no-op at best).
+  void _beginCheck() {
     _checkTimeout?.cancel();
-    setState(() => _checking = true);
+    _checking = true;
     _ws.send('screen_check');
     _checkTimeout = Timer(_checkTimeoutDuration, () {
       if (!mounted || !_checking) return;
@@ -277,37 +299,22 @@ class _ScreenTabState extends State<ScreenTab> {
     );
   }
 
-  void _onTapDown(TapDownDetails d) {
-    if (!_streaming) return;
-    final remote = _toRemote(d.localPosition);
-    _pendingDownAt = remote;
-    _ws.send('screen_input', {
-      'input_type': 'mouse_down',
-      'data': {'x': remote.dx.toInt(), 'y': remote.dy.toInt(), 'button': 1},
-    });
-  }
-
+  /// A click is emitted as a down/up pair only once the tap is CONFIRMED
+  /// (onTapUp). Sending mouse_down from onTapDown would leave the remote button
+  /// held whenever the tap turns into an InteractiveViewer pan or pinch — and
+  /// synthesising the missing mouse_up on cancel would instead turn every pan
+  /// into a stray click. Emitting nothing until the tap wins the arena avoids
+  /// both failure modes.
   void _onTapUp(TapUpDetails d) {
     if (!_streaming) return;
-    _pendingDownAt = null;
     final remote = _toRemote(d.localPosition);
-    _ws.send('screen_input', {
-      'input_type': 'mouse_up',
-      'data': {'x': remote.dx.toInt(), 'y': remote.dy.toInt(), 'button': 1},
-    });
-  }
-
-  /// The tap lost the gesture arena (the finger moved into an InteractiveViewer
-  /// pan/pinch) after onTapDown already sent a mouse_down. Without a matching
-  /// mouse_up the remote button stays held and the desktop drag-selects.
-  void _onTapCancel() {
-    final down = _pendingDownAt;
-    _pendingDownAt = null;
-    if (!_streaming || down == null) return;
-    _ws.send('screen_input', {
-      'input_type': 'mouse_up',
-      'data': {'x': down.dx.toInt(), 'y': down.dy.toInt(), 'button': 1},
-    });
+    final data = {
+      'x': remote.dx.toInt(),
+      'y': remote.dy.toInt(),
+      'button': 1,
+    };
+    _ws.send('screen_input', {'input_type': 'mouse_down', 'data': data});
+    _ws.send('screen_input', {'input_type': 'mouse_up', 'data': data});
   }
 
   void _onDoubleTapDown(TapDownDetails d) {
@@ -356,6 +363,7 @@ class _ScreenTabState extends State<ScreenTab> {
     _ws.off('screen_check_res', _checkHandler);
     _ws.off('screen_error', _errorHandler);
     _ws.off('_connected', _connHandler);
+    _ws.off('_disconnected', _disconnHandler);
     _currentFrame?.dispose();
     _transformCtrl.dispose();
     _typeCtrl.dispose();
@@ -398,9 +406,7 @@ class _ScreenTabState extends State<ScreenTab> {
                                       child: LayoutBuilder(
                                         builder: (context, constraints) => GestureDetector(
                                           behavior: HitTestBehavior.opaque,
-                                          onTapDown: _onTapDown,
                                           onTapUp: _onTapUp,
-                                          onTapCancel: _onTapCancel,
                                           onDoubleTapDown: _onDoubleTapDown,
                                           child: CustomPaint(
                                             key: _canvasKey,

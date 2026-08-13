@@ -13,7 +13,7 @@ void main() {
 
   group('CommandHistoryService', () {
     test('add + navigate previous/next', () async {
-      final h = CommandHistoryService();
+      final h = CommandHistoryService.instance;
       await h.load();
       await h.add('ls');
       await h.add('pwd');
@@ -31,7 +31,7 @@ void main() {
 
     test('skips blanks and consecutive duplicates, re-adds move to front',
         () async {
-      final h = CommandHistoryService();
+      final h = CommandHistoryService.instance;
       await h.load();
       await h.add('a');
       await h.add('a');
@@ -42,12 +42,12 @@ void main() {
     });
 
     test('persists across instances and caps at 50', () async {
-      final h = CommandHistoryService();
+      final h = CommandHistoryService.instance;
       await h.load();
       for (var i = 0; i < 60; i++) {
         await h.add('cmd$i');
       }
-      final h2 = CommandHistoryService();
+      final h2 = CommandHistoryService.instance;
       await h2.load();
       expect(h2.entries.length, 50);
       expect(h2.entries.last, 'cmd59');

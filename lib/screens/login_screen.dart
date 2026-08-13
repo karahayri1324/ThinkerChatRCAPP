@@ -119,6 +119,12 @@ class _LoginScreenState extends State<LoginScreen> {
     });
   }
 
+  Future<void> _forgetProfile(ServerProfile profile) async {
+    await ServerHistoryService.remove(profile.url);
+    final profiles = await ServerHistoryService.load();
+    if (mounted) setState(() => _recentServers = profiles);
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = context.watch<ThemeService>().current;
@@ -199,18 +205,34 @@ class _LoginScreenState extends State<LoginScreen> {
                       for (final p in _recentServers)
                         PopupMenuItem(
                           value: p,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
+                          child: Row(
                             children: [
-                              Text(p.url,
-                                  style: TextStyle(
-                                      color: t.textPrimary, fontSize: 13),
-                                  overflow: TextOverflow.ellipsis),
-                              if (p.username.isNotEmpty)
-                                Text(p.username,
-                                    style: TextStyle(
-                                        color: t.textMuted, fontSize: 11)),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(p.url,
+                                        style: TextStyle(
+                                            color: t.textPrimary, fontSize: 13),
+                                        overflow: TextOverflow.ellipsis),
+                                    if (p.username.isNotEmpty)
+                                      Text(p.username,
+                                          style: TextStyle(
+                                              color: t.textMuted, fontSize: 11)),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                icon: Icon(Icons.close,
+                                    size: 16, color: t.textMuted),
+                                tooltip: 'Forget this server',
+                                visualDensity: VisualDensity.compact,
+                                onPressed: () {
+                                  Navigator.pop(context);
+                                  _forgetProfile(p);
+                                },
+                              ),
                             ],
                           ),
                         ),

@@ -90,9 +90,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _probeSession() async {
     if (!mounted) return;
     final auth = context.read<AuthService>();
+    // Remember which token we are judging: the verdict can land after the user
+    // has logged out or signed in again, and must not condemn a newer session.
+    final probedToken = auth.token;
+    if (probedToken == null) return;
     final validity = await auth.validateSession();
+    if (!mounted) return;
     if (validity == SessionValidity.invalid) {
-      auth.markSessionExpired();
+      auth.markSessionExpired(expectedToken: probedToken);
     } else {
       // Server reachable-but-flaky or fully down: allow a future streak of
       // failures to trigger another probe.

@@ -13,6 +13,32 @@ import 'screens/home_screen.dart';
 /// which screen is on top.
 final navigatorKey = GlobalKey<NavigatorState>();
 
+/// Name of the route currently on top, tracked so session-expiry handling can
+/// tell whether the login screen is already showing.
+String? _currentRouteName;
+
+class _RouteTracker extends NavigatorObserver {
+  void _update(Route<dynamic>? route) {
+    if (route is PageRoute) _currentRouteName = route.settings.name;
+  }
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _update(route);
+
+  @override
+  void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) =>
+      _update(newRoute);
+
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _update(previousRoute);
+
+  @override
+  void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _update(previousRoute);
+}
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
@@ -31,9 +57,11 @@ void main() {
   auth.onSessionExpired = () {
     ws.disconnect();
     final nav = navigatorKey.currentState;
-    if (nav != null) {
-      nav.pushNamedAndRemoveUntil('/login', (route) => false);
-    }
+    if (nav == null) return;
+    // Never re-push /login over itself: doing so wipes a login the user is in
+    // the middle of typing, and would discard a successful one.
+    if (_currentRouteName == '/login') return;
+    nav.pushNamedAndRemoveUntil('/login', (route) => false);
   };
 
   runApp(RCApp(auth: auth, ws: ws, themeSvc: themeSvc));
@@ -72,6 +100,7 @@ class RCApp extends StatelessWidget {
             title: 'RemoteController',
             debugShowCheckedModeBanner: false,
             navigatorKey: navigatorKey,
+            navigatorObservers: [_RouteTracker()],
             theme: t.toFlutterTheme(),
             initialRoute: '/splash',
             routes: {

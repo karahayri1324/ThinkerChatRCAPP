@@ -53,11 +53,18 @@ class AuthService extends ChangeNotifier {
   /// Token expiry when the token is a JWT with an `exp` claim, else null.
   DateTime? get tokenExpiry => _token == null ? null : decodeJwtExpiry(_token!);
 
-  /// Logged in AND (token is opaque, or its JWT expiry is still in the future).
+  /// Device clocks drift. Only treat a JWT as locally expired once it is past
+  /// due by more than this, so a fast phone clock can't throw away a token the
+  /// server would still have accepted.
+  static const _clockSkewAllowance = Duration(minutes: 10);
+
+  /// Logged in AND (token is opaque, or its JWT expiry is still in the future
+  /// allowing for clock skew).
   bool get hasValidSession {
     if (!_isLoggedIn || _token == null) return false;
     final exp = tokenExpiry;
-    return exp == null || exp.isAfter(DateTime.now());
+    return exp == null ||
+        exp.isAfter(DateTime.now().subtract(_clockSkewAllowance));
   }
 
   String? consumeSessionNotice() {
@@ -90,16 +97,22 @@ class AuthService extends ChangeNotifier {
   /// null right after boot / under keystore contention), falling back to the
   /// legacy storage location for values written by older app versions.
   Future<String?> _readRobust(String key) async {
+    var definitivelyAbsent = false;
     for (var attempt = 0; attempt < 3; attempt++) {
       try {
         final value = await _storage.read(key: key);
         if (value != null) return value;
-        break; // definitive null — fall through to legacy
+        definitivelyAbsent = true;
+        break;
       } catch (e) {
         debugPrint('Secure storage read "$key" attempt ${attempt + 1}: $e');
         await Future.delayed(Duration(milliseconds: 100 * (attempt + 1)));
       }
     }
+    // Only consult the legacy store when the hardened one answered "no such
+    // key". If it merely kept throwing, a stale legacy value could otherwise
+    // overwrite a perfectly good hardened token during migration.
+    if (!definitivelyAbsent) return null;
     try {
       final legacy = await _legacyStorage.read(key: key);
       if (legacy != null) {
@@ -147,17 +160,22 @@ class AuthService extends ChangeNotifier {
     if (url.isEmpty) {
       throw const FormatException('Please enter a server URL');
     }
-    while (url.endsWith('/')) {
-      url = url.substring(0, url.length - 1);
-    }
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       url = 'https://$url';
     }
-    final uri = Uri.tryParse(url);
-    if (uri == null || uri.host.isEmpty) {
+    // Strip trailing slashes from the authority/path only — doing it before the
+    // scheme check would turn a bare "http://" into "https://http:".
+    final scheme = url.startsWith('https://') ? 'https://' : 'http://';
+    var rest = url.substring(scheme.length);
+    while (rest.endsWith('/')) {
+      rest = rest.substring(0, rest.length - 1);
+    }
+    final normalized = '$scheme$rest';
+    final uri = Uri.tryParse(normalized);
+    if (uri == null || uri.host.isEmpty || uri.host.contains(' ')) {
       throw const FormatException('Invalid server URL');
     }
-    return url;
+    return normalized;
   }
 
   /// Build the WS endpoint from a normalized server URL, preserving any path
@@ -290,8 +308,14 @@ class AuthService extends ChangeNotifier {
   /// The server told us our token is no longer valid (401, or repeated WS
   /// rejections). Clear the token but keep server URL + username so the user
   /// only has to re-enter the password.
+  ///
+  /// [expectedToken] guards against a slow verdict landing after the user has
+  /// already signed in again: if the current token is no longer the one the
+  /// caller was judging, the verdict is stale and must be ignored.
   Future<void> markSessionExpired(
-      {String notice = 'Your session has expired. Please log in again.'}) async {
+      {String notice = 'Your session has expired. Please log in again.',
+      String? expectedToken}) async {
+    if (expectedToken != null && expectedToken != _token) return;
     if (_authRejectionHandled) return;
     _authRejectionHandled = true;
     _token = null;
@@ -306,14 +330,20 @@ class AuthService extends ChangeNotifier {
     onSessionExpired?.call();
   }
 
+  /// Explicit user-initiated sign-out: unlike [markSessionExpired] this also
+  /// forgets who was signed in.
   Future<void> logout() async {
     _token = null;
+    _username = null;
     _pendingToken = null;
     _isLoggedIn = false;
     _sessionNotice = null;
+    _authRejectionHandled = false;
     try {
       await _storage.delete(key: _tokenKey);
+      await _storage.delete(key: _usernameKey);
       await _legacyStorage.delete(key: _tokenKey);
+      await _legacyStorage.delete(key: _usernameKey);
     } catch (_) {}
     notifyListeners();
   }
@@ -342,8 +372,13 @@ class AuthService extends ChangeNotifier {
         if (_token != null) 'Authorization': 'Bearer $_token',
       };
 
+  /// [expireOn401] must be false for endpoints that take the user's password:
+  /// servers commonly answer 401 for "wrong current password", and treating
+  /// that as session expiry would throw away a perfectly valid token.
   Future<Map<String, dynamic>> _safePost(
-      String endpoint, Map<String, dynamic> body) async {
+      String endpoint, Map<String, dynamic> body,
+      {bool expireOn401 = true}) async {
+    final tokenAtRequest = _token;
     try {
       final resp = await http
           .post(
@@ -352,8 +387,8 @@ class AuthService extends ChangeNotifier {
             body: jsonEncode(body),
           )
           .timeout(_httpTimeout);
-      if (resp.statusCode == 401) {
-        markSessionExpired();
+      if (resp.statusCode == 401 && expireOn401) {
+        markSessionExpired(expectedToken: tokenAtRequest);
         return {'success': false, 'error': 'Session expired'};
       }
       try {
@@ -373,12 +408,13 @@ class AuthService extends ChangeNotifier {
   }
 
   Future<Map<String, dynamic>> _safeGet(String endpoint) async {
+    final tokenAtRequest = _token;
     try {
       final resp = await http
           .get(Uri.parse('$_baseUrl$endpoint'), headers: authHeaders)
           .timeout(_httpTimeout);
       if (resp.statusCode == 401) {
-        markSessionExpired();
+        markSessionExpired(expectedToken: tokenAtRequest);
         return {'error': 'Session expired'};
       }
       try {
@@ -394,8 +430,9 @@ class AuthService extends ChangeNotifier {
   }
 
   Future<Map<String, dynamic>> changePassword(String oldPw, String newPw) async {
-    return _safePost(
-        '/api/change-password', {'old_password': oldPw, 'new_password': newPw});
+    return _safePost('/api/change-password',
+        {'old_password': oldPw, 'new_password': newPw},
+        expireOn401: false);
   }
 
   Future<Map<String, dynamic>> get2FAStatus() async {
@@ -411,6 +448,7 @@ class AuthService extends ChangeNotifier {
   }
 
   Future<Map<String, dynamic>> disable2FA(String password) async {
-    return _safePost('/api/2fa/disable', {'password': password});
+    return _safePost('/api/2fa/disable', {'password': password},
+        expireOn401: false);
   }
 }

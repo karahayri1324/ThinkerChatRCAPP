@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:open_file/open_file.dart';
 import 'package:path_provider/path_provider.dart';
+import '../services/download_registry.dart';
 import '../services/theme_service.dart';
 
 /// Bottom sheet listing files previously downloaded into the app's documents
@@ -30,6 +31,9 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
           .listSync()
           .whereType<File>()
           .where((f) => !f.path.split('/').last.startsWith('.'))
+          // Hide files still being written: opening a partial download or
+          // deleting it out from under the transfer would both misbehave.
+          .where((f) => !DownloadRegistry.isActive(f.path))
           .toList()
         ..sort((a, b) =>
             b.statSync().modified.compareTo(a.statSync().modified));
@@ -142,7 +146,7 @@ class _DownloadsSheetState extends State<DownloadsSheet> {
                         },
                       ),
           ),
-          SafeArea(top: false, child: const SizedBox(height: 4)),
+          const SafeArea(top: false, child: SizedBox(height: 4)),
         ],
       ),
     );

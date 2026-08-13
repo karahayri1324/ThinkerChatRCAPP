@@ -1,7 +1,7 @@
 name: rc_app
 description: "ThinkerChat Remote Controller - Mobile App"
 publish_to: 'none'
-version: 1.0.5+6
+version: 1.1.0+7
 
 environment:
   sdk: ^3.5.4

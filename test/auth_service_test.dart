@@ -38,6 +38,14 @@ void main() {
     test('rejects garbage without a host', () {
       expect(() => AuthService.normalizeServerUrl('http://'),
           throwsFormatException);
+      expect(() => AuthService.normalizeServerUrl('https://'),
+          throwsFormatException);
+      expect(() => AuthService.normalizeServerUrl('/'), throwsFormatException);
+    });
+
+    test('preserves a path prefix', () {
+      expect(AuthService.normalizeServerUrl('https://host.com/relay/'),
+          'https://host.com/relay');
     });
   });
 

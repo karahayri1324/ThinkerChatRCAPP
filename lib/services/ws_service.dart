@@ -22,6 +22,8 @@ class WsService extends ChangeNotifier {
   Timer? _heartbeatTimer;
   Timer? _watchdogTimer;
   Timer? _connectTimer;
+  Timer? _resumeProbeTimer;
+  static const _resumeProbeTimeout = Duration(seconds: 8);
   DateTime? _lastMessageAt;
   String? _url;
 
@@ -65,6 +67,9 @@ class WsService extends ChangeNotifier {
     } catch (_) {}
     _channel = null;
     _stopHeartbeat();
+    // A resume probe against the socket we are replacing is meaningless now.
+    _resumeProbeTimer?.cancel();
+    _resumeProbeTimer = null;
     _gotMessageThisAttempt = false;
     _connectTimer?.cancel();
     _connectTimer = Timer(_connectTimeout, _onConnectTimeout);
@@ -106,6 +111,8 @@ class WsService extends ChangeNotifier {
   void _onConnectionLost() {
     _connectTimer?.cancel();
     _connectTimer = null;
+    _resumeProbeTimer?.cancel();
+    _resumeProbeTimer = null;
     _connected = false;
     _stopHeartbeat();
     _noteFailedAttempt();
@@ -215,16 +222,31 @@ class WsService extends ChangeNotifier {
     if (last == null ||
         DateTime.now().difference(last) > _staleThreshold) {
       forceReconnect();
-    } else {
-      // Healthy but possibly idle after a doze: poke the server so the
-      // watchdog has fresh evidence either way.
-      send('heartbeat');
+      return;
     }
+    // Looks healthy, but a socket can die silently while the app is
+    // backgrounded. Poke the server and give it a short window to answer —
+    // waiting for the 50 s watchdog would leave the UI claiming "connected"
+    // while every message vanishes.
+    final probeSentAt = DateTime.now();
+    send('heartbeat');
+    _resumeProbeTimer?.cancel();
+    _resumeProbeTimer = Timer(_resumeProbeTimeout, () {
+      _resumeProbeTimer = null;
+      final latest = _lastMessageAt;
+      if (latest == null || latest.isBefore(probeSentAt)) {
+        debugPrint('WS resume probe unanswered, reconnecting');
+        forceReconnect();
+      }
+    });
   }
 
   void _scheduleReconnect() {
     if (!_shouldReconnect) return;
     _reconnectAttempts++;
+    // The attempt count is part of what the banner shows, and callers notify
+    // before scheduling — publish the new value so the banner isn't a step behind.
+    notifyListeners();
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(Duration(milliseconds: _reconnectDelay), () {
       _doConnect();
@@ -242,10 +264,19 @@ class WsService extends ChangeNotifier {
       channel.sink.add(msg);
     } catch (e) {
       debugPrint('WS send error: $e');
+      // Tear the dead socket down here rather than waiting for onDone, which
+      // may lag or never fire — and which would otherwise re-run this whole
+      // disconnect path a second time.
+      _subscription?.cancel();
+      _subscription = null;
+      try {
+        _channel?.sink.close();
+      } catch (_) {}
+      _channel = null;
+      _connectTimer?.cancel();
+      _connectTimer = null;
       _connected = false;
       _stopHeartbeat();
-      // Keep every subscriber's view consistent with `connected` — the stream's
-      // onDone may lag or never fire for a dead sink.
       _dispatch('_disconnected', {});
       notifyListeners();
       _scheduleReconnect();
@@ -281,6 +312,8 @@ class WsService extends ChangeNotifier {
     _reconnectTimer?.cancel();
     _connectTimer?.cancel();
     _connectTimer = null;
+    _resumeProbeTimer?.cancel();
+    _resumeProbeTimer = null;
     _stopHeartbeat();
     _subscription?.cancel();
     _subscription = null;

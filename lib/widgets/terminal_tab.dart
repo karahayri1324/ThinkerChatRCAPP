@@ -35,11 +35,14 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
   final TextEditingController _inputCtrl = TextEditingController();
   final FocusNode _inputFocusNode = FocusNode();
   bool _useInputBar = true;
-  final CommandHistoryService _cmdHistory = CommandHistoryService();
+  final CommandHistoryService _cmdHistory = CommandHistoryService.instance;
 
   // History save debounce
   Timer? _saveTimer;
   final Map<String, String> _pendingSaves = {};
+  /// Shell ids the user explicitly closed; their output must never be written
+  /// back by a flush that was already in flight.
+  final Set<String> _closedShells = {};
   static const _saveDebounce = Duration(seconds: 3);
   // Flush immediately once a shell's pending buffer crosses this size, so a
   // continuously-streaming shell (e.g. `top`) can't grow unbounded in RAM and
@@ -103,6 +106,9 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
     final saves = Map<String, String>.of(_pendingSaves);
     _pendingSaves.clear();
     for (final entry in saves.entries) {
+      // A shell closed mid-flush must stay closed: writing its buffered output
+      // now would resurrect the scrollback _closeShell just cleared.
+      if (_closedShells.contains(entry.key)) continue;
       await TerminalHistoryService.saveOutput(entry.key, entry.value);
     }
   }
@@ -136,20 +142,24 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
       });
     };
 
+    // Register the shell BEFORE awaiting the history read: a '_connected' event
+    // arriving during that await would otherwise not see this shell and would
+    // never create it server-side.
+    setState(() {
+      _shells.add(_ShellEntry(shellId, terminal, focusNode));
+      _activeIndex = _shells.length - 1;
+    });
+
     // Create the shell server-side before any input/resize can be emitted, so
     // shell_input/shell_resize never race ahead of shell_create.
     _ws.send('shell_create', {'shell_id': shellId});
 
     final savedHistory = await TerminalHistoryService.getOutput(shellId);
+    if (!mounted) return;
     if (savedHistory != null && savedHistory.isNotEmpty) {
       terminal.write(savedHistory);
       terminal.write('\r\n--- Session restored ---\r\n');
     }
-
-    setState(() {
-      _shells.add(_ShellEntry(shellId, terminal, focusNode));
-      _activeIndex = _shells.length - 1;
-    });
   }
 
   void _closeShell(int index) {
@@ -159,6 +169,7 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
     entry.focusNode.dispose();
     // An explicitly closed shell must not leave scrollback behind: shell ids
     // are reused across app restarts, so a future shell would replay it.
+    _closedShells.add(entry.id);
     _pendingSaves.remove(entry.id);
     TerminalHistoryService.clearShell(entry.id);
     setState(() {
@@ -253,6 +264,7 @@ class _TerminalTabState extends State<TerminalTab> with WidgetsBindingObserver {
     final saves = Map<String, String>.of(_pendingSaves);
     _pendingSaves.clear();
     for (final entry in saves.entries) {
+      if (_closedShells.contains(entry.key)) continue;
       TerminalHistoryService.saveOutput(entry.key, entry.value);
     }
     _ws.off('shell_output', _outputHandler);

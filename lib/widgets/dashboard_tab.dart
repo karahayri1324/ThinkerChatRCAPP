@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../services/ws_service.dart';
 import '../services/theme_service.dart';
 import 'connection_banner.dart';
+import 'sparkline.dart';
 
 class DashboardTab extends StatefulWidget {
   /// Index of this tab and a listenable of the currently-visible tab index, so
@@ -31,6 +32,21 @@ class _DashboardTabState extends State<DashboardTab>
   String _upSpeed = '';
   String _downSpeed = '';
 
+  // Rolling history for the sparklines (~2.5 minutes at the 3 s poll rate).
+  static const _historyLength = 50;
+  final List<double> _cpuHistory = [];
+  final List<double> _memHistory = [];
+  final List<double> _netUpHistory = [];
+  final List<double> _netDownHistory = [];
+  DateTime? _lastSampleAt;
+
+  static void _push(List<double> series, double value) {
+    series.add(value);
+    if (series.length > _historyLength) {
+      series.removeRange(0, series.length - _historyLength);
+    }
+  }
+
   @override
   bool get wantKeepAlive => true;
 
@@ -45,7 +61,11 @@ class _DashboardTabState extends State<DashboardTab>
       if (!mounted) return;
       final data = msg['payload'] as Map<String, dynamic>?;
       _updateNetworkSpeed(data);
-      setState(() => _data = data);
+      _recordHistory(data);
+      setState(() {
+        _data = data;
+        _lastSampleAt = DateTime.now();
+      });
     };
     _ws.on('sysinfo_res', _handler);
     widget.activeTab?.addListener(_onVisibilityChanged);
@@ -72,8 +92,12 @@ class _DashboardTabState extends State<DashboardTab>
       // Skip on counter resets (negative deltas) which would otherwise render
       // nonsensical speeds like "-500 MB/s".
       if (dt > 0 && sentDelta >= 0 && recvDelta >= 0) {
-        _upSpeed = '${_formatBytes((sentDelta / dt).toInt())}/s';
-        _downSpeed = '${_formatBytes((recvDelta / dt).toInt())}/s';
+        final upRate = sentDelta / dt;
+        final downRate = recvDelta / dt;
+        _upSpeed = '${_formatBytes(upRate.toInt())}/s';
+        _downSpeed = '${_formatBytes(downRate.toInt())}/s';
+        _push(_netUpHistory, upRate);
+        _push(_netDownHistory, downRate);
       }
     }
     _prevBytesSent = (net['bytes_sent'] as num?)?.toInt();
@@ -81,10 +105,35 @@ class _DashboardTabState extends State<DashboardTab>
     _prevNetTime = now;
   }
 
+  void _recordHistory(Map<String, dynamic>? data) {
+    if (data == null) return;
+    final cpu = (data['cpu_percent'] as List<dynamic>?)
+            ?.whereType<num>()
+            .map((e) => e.toDouble())
+            .toList() ??
+        const [];
+    if (cpu.isNotEmpty) {
+      _push(_cpuHistory, cpu.reduce((a, b) => a + b) / cpu.length);
+    }
+    final memPercent =
+        ((data['mem'] as Map<String, dynamic>?)?['percent'] as num?)?.toDouble();
+    if (memPercent != null) _push(_memHistory, memPercent);
+  }
+
+  /// Highest value in a series, used to label the network sparkline.
+  static double _peak(List<double> series) =>
+      series.isEmpty ? 0 : series.reduce((a, b) => a > b ? a : b);
+
   void _startPolling() {
+    // Restart the freshness clock: while the tab was off-screen no polls were
+    // sent, so the age of the last sample says nothing about the agent's health
+    // and would otherwise flash a false "stale" warning on every return here.
+    _lastSampleAt = DateTime.now();
     _ws.send('sysinfo_req');
     _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _ws.send('sysinfo_req');
+      // Re-render even without a reply so the staleness notice appears.
+      if (mounted && _data != null) setState(() {});
     });
   }
 
@@ -194,7 +243,22 @@ class _DashboardTabState extends State<DashboardTab>
       if (hours > 0) parts.add('${hours}h'); parts.add('${mins}m');
       uptime = parts.join(' ');
     }
+    // Poll answers stop arriving silently when the agent goes away; say so
+    // instead of leaving the last snapshot looking live.
+    final age = _lastSampleAt == null
+        ? null
+        : DateTime.now().difference(_lastSampleAt!).inSeconds;
     return _card(t, 'System', Column(children: [
+      if (age != null && age > 10)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Row(children: [
+            Icon(Icons.update_disabled, size: 13, color: t.warning),
+            const SizedBox(width: 6),
+            Text('Stale — last update ${age}s ago',
+                style: TextStyle(color: t.warning, fontSize: 11)),
+          ]),
+        ),
       _infoRow(t, 'Hostname', d['hostname']?.toString() ?? '-'),
       _infoRow(t, 'Platform', d['platform']?.toString() ?? '-'),
       if (uptime.isNotEmpty) _infoRow(t, 'Uptime', uptime),
@@ -208,29 +272,62 @@ class _DashboardTabState extends State<DashboardTab>
     final cpuPercent = (_data!['cpu_percent'] as List<dynamic>?)?.map((e) => (e as num).toDouble()).toList() ?? [];
     final avg = cpuPercent.isEmpty ? 0.0 : cpuPercent.reduce((a, b) => a + b) / cpuPercent.length;
     final cores = _data!['cpu_count'] ?? cpuPercent.length;
+    final avgColor = avg > 80 ? t.danger : avg > 50 ? t.warning : t.accent;
     return _card(t, 'CPU ($cores cores) - ${avg.toStringAsFixed(1)}%',
-      SizedBox(height: 60, child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: cpuPercent.map((pct) {
-          final color = pct > 80 ? t.danger : pct > 50 ? t.warning : t.accent;
-          return Expanded(child: Container(
-            margin: const EdgeInsets.symmetric(horizontal: 1),
-            height: (pct / 100 * 60).clamp(2, 60),
-            decoration: BoxDecoration(color: color, borderRadius: const BorderRadius.vertical(top: Radius.circular(2))),
-          ));
-        }).toList(),
-      )),
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(height: 60, child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: cpuPercent.map((pct) {
+              final color = pct > 80 ? t.danger : pct > 50 ? t.warning : t.accent;
+              return Expanded(child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 1),
+                height: (pct / 100 * 60).clamp(2, 60),
+                decoration: BoxDecoration(color: color, borderRadius: const BorderRadius.vertical(top: Radius.circular(2))),
+              ));
+            }).toList(),
+          )),
+          if (_cpuHistory.length > 1) ...[
+            const SizedBox(height: 10),
+            // Sample count, not elapsed time: polling pauses while the tab is
+            // off-screen, so the series is not a contiguous 3 s timeline.
+            _historyLabel(t, 'Average, last ${_cpuHistory.length} samples',
+                'peak ${_peak(_cpuHistory).toStringAsFixed(0)}%'),
+            const SizedBox(height: 2),
+            Sparkline(values: _cpuHistory, maxY: 100, color: avgColor),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _historyLabel(AppThemeData t, String left, String right) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(left, style: TextStyle(color: t.textMuted, fontSize: 10)),
+        Text(right, style: TextStyle(color: t.textMuted, fontSize: 10)),
+      ],
     );
   }
 
   Widget _buildMemoryCard(AppThemeData t) {
     final mem = _data!['mem'] as Map<String, dynamic>? ?? {};
     final percent = (mem['percent'] as num?)?.toDouble() ?? 0;
+    final memColor = percent > 80 ? t.danger : percent > 60 ? t.warning : t.accent;
     return _card(t, 'Memory', Column(children: [
       _infoRow(t, 'Used / Total', '${_formatBytes(mem['used'])} / ${_formatBytes(mem['total'])}'),
       _progressBar(t, percent),
       const SizedBox(height: 4),
       _infoRow(t, '${percent.toStringAsFixed(1)}% used', '${_formatBytes(mem['available'])} free'),
+      if (_memHistory.length > 1) ...[
+        const SizedBox(height: 8),
+        _historyLabel(t, 'Last ${_memHistory.length} samples',
+            'peak ${_peak(_memHistory).toStringAsFixed(0)}%'),
+        const SizedBox(height: 2),
+        Sparkline(values: _memHistory, maxY: 100, color: memColor),
+      ],
     ]));
   }
 
@@ -248,11 +345,36 @@ class _DashboardTabState extends State<DashboardTab>
 
   Widget _buildNetworkCard(AppThemeData t) {
     final net = _data!['net'] as Map<String, dynamic>? ?? {};
+    // Both charts share one y-scale so the lines stay visually comparable, but
+    // each is labelled with its OWN peak — labelling the download chart with a
+    // shared maximum would report an upload spike as a download one.
+    final upPeak = _peak(_netUpHistory);
+    final downPeak = _peak(_netDownHistory);
+    final netMax = upPeak > downPeak ? upPeak : downPeak;
     return _card(t, 'Network', Column(children: [
       _infoRow(t, 'Total Sent', _formatBytes(net['bytes_sent'])),
       _infoRow(t, 'Total Received', _formatBytes(net['bytes_recv'])),
       if (_upSpeed.isNotEmpty) _infoRow(t, 'Upload', _upSpeed),
       if (_downSpeed.isNotEmpty) _infoRow(t, 'Download', _downSpeed),
+      if (_netDownHistory.length > 1) ...[
+        const SizedBox(height: 8),
+        _historyLabel(t, 'Download',
+            'peak ${_formatBytes(downPeak.toInt())}/s'),
+        const SizedBox(height: 2),
+        Sparkline(
+            values: _netDownHistory,
+            maxY: netMax > 0 ? netMax : null,
+            color: t.success,
+            height: 28),
+        const SizedBox(height: 6),
+        _historyLabel(t, 'Upload', 'peak ${_formatBytes(upPeak.toInt())}/s'),
+        const SizedBox(height: 2),
+        Sparkline(
+            values: _netUpHistory,
+            maxY: netMax > 0 ? netMax : null,
+            color: t.warning,
+            height: 28),
+      ],
     ]));
   }
 

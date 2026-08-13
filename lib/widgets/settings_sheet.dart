@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../services/auth_service.dart';
+import '../services/command_history_service.dart';
 import '../services/theme_service.dart';
 import '../services/terminal_history_service.dart';
+import 'downloads_sheet.dart';
 
 class SettingsSheet extends StatefulWidget {
   const SettingsSheet({super.key});
@@ -134,6 +136,18 @@ class _SettingsSheetState extends State<SettingsSheet> {
     }
   }
 
+  Future<void> _clearCommandHistory() async {
+    await CommandHistoryService.instance.clear();
+    if (mounted) {
+      final t = context.read<ThemeService>().current;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+            content: const Text('Command history cleared'),
+            backgroundColor: t.success),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = context.watch<ThemeService>().current;
@@ -153,7 +167,13 @@ class _SettingsSheetState extends State<SettingsSheet> {
                 decoration: BoxDecoration(color: t.textMuted, borderRadius: BorderRadius.circular(2)))),
               const SizedBox(height: 16),
               Text('SETTINGS', style: TextStyle(color: t.textPrimary, fontSize: 16, fontWeight: FontWeight.w600)),
-              const SizedBox(height: 24),
+              const SizedBox(height: 20),
+
+              // Session summary
+              _buildSessionCard(t),
+              const SizedBox(height: 20),
+              Divider(color: t.border),
+              const SizedBox(height: 16),
 
               // Theme Selection
               _sectionTitle(t, 'Theme'),
@@ -256,14 +276,94 @@ class _SettingsSheetState extends State<SettingsSheet> {
                 ],
               ),
               const SizedBox(height: 8),
-              Text('Terminal output is saved locally for session restoration.',
+              Text('Terminal output and submitted commands are saved locally '
+                  'for session restoration and command recall.',
                 style: TextStyle(color: t.textMuted, fontSize: 12)),
               const SizedBox(height: 12),
               _actionButton(t, 'Clear Terminal History', _clearHistory, color: t.danger),
+              const SizedBox(height: 8),
+              _actionButton(t, 'Clear Command History', _clearCommandHistory,
+                  color: Colors.transparent, textColor: t.textMuted),
+
+              const SizedBox(height: 20),
+              Divider(color: t.border),
+              const SizedBox(height: 16),
+
+              // Storage
+              _sectionTitle(t, 'Storage'),
+              const SizedBox(height: 10),
+              _actionButton(t, 'Downloaded Files', () {
+                // Capture the Navigator first: after pop(), this sheet's own
+                // context is defunct and can't host the next route.
+                final navigator = Navigator.of(context);
+                navigator.pop();
+                showModalBottomSheet(
+                  context: navigator.context,
+                  backgroundColor: Colors.transparent,
+                  isScrollControlled: true,
+                  builder: (_) => const DownloadsSheet(),
+                );
+              }),
+              const SizedBox(height: 24),
             ],
           ),
         );
       },
+    );
+  }
+
+  Widget _buildSessionCard(AppThemeData t) {
+    final auth = context.watch<AuthService>();
+    final expiry = auth.tokenExpiry;
+    final expiryLabel = expiry == null
+        ? 'No expiry (opaque token)'
+        : expiry.isBefore(DateTime.now())
+            ? 'Expired'
+            : 'Valid until ${expiry.toLocal().toString().substring(0, 16)}';
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: t.bgPrimary,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: t.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(Icons.account_circle, size: 16, color: t.accent),
+            const SizedBox(width: 8),
+            Text(auth.username ?? 'Unknown user',
+                style: TextStyle(
+                    color: t.textPrimary,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600)),
+          ]),
+          const SizedBox(height: 8),
+          _kv(t, 'Server', auth.serverUrl ?? '-'),
+          _kv(t, 'Session', expiryLabel),
+        ],
+      ),
+    );
+  }
+
+  Widget _kv(AppThemeData t, String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+              width: 64,
+              child: Text(label,
+                  style: TextStyle(color: t.textMuted, fontSize: 12))),
+          Expanded(
+            child: Text(value,
+                style: TextStyle(color: t.textSecondary, fontSize: 12),
+                overflow: TextOverflow.ellipsis),
+          ),
+        ],
+      ),
     );
   }
 
